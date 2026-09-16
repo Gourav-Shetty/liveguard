@@ -3,21 +3,8 @@ import sys
 import time
 
 from edge_system import config
-from edge_system.drivers.serial_driver import ArduinoSerialDriver
-from edge_system.drivers.mock_driver import MockSensorDriver
 from edge_system.signal_processing import RealTimeFilter, PanTompkinsQRSDetector, BeatSegmenter
 from edge_system.edge_infer import EdgeInferenceEngine
-from edge_system.telemetry_server import TelemetryServer
-
-try:
-    from edge_system.drivers.rpi_mcp3008_driver import RPiMCP3008Driver
-except Exception:
-    RPiMCP3008Driver = None
-
-try:
-    from edge_system.drivers.ads1115_driver import ADS1115Driver
-except Exception:
-    ADS1115Driver = None
 
 
 def parse_args():
@@ -49,24 +36,51 @@ def parse_args():
 
 
 def get_driver(source: str, port: str = None):
-    if source == "ARDUINO":
+    if source == "MOCK":
+        from edge_system.drivers.mock_driver import MockSensorDriver
+        return MockSensorDriver()
+
+    elif source == "ARDUINO":
+        try:
+            from edge_system.drivers.serial_driver import ArduinoSerialDriver
+        except ImportError:
+            print("[ERROR] pyserial is required for ARDUINO mode. Run: sudo apt install -y python3-serial")
+            sys.exit(1)
         driver = ArduinoSerialDriver(port=port)
         driver.connect()
         return driver
-    elif source == "MOCK":
-        return MockSensorDriver()
+
     elif source == "RPI_SPI":
-        if RPiMCP3008Driver is None:
-            print("[ERROR] RPiMCP3008Driver is only available on Raspberry Pi.")
+        try:
+            from edge_system.drivers.rpi_mcp3008_driver import RPiMCP3008Driver
+            return RPiMCP3008Driver()
+        except Exception as e:
+            print(f"[ERROR] Could not initialize RPi MCP3008 driver: {e}")
             sys.exit(1)
-        return RPiMCP3008Driver()
+
     elif source == "ADS1115":
-        if ADS1115Driver is None:
-            print("[ERROR] ADS1115Driver is only available on Raspberry Pi.")
+        try:
+            from edge_system.drivers.ads1115_driver import ADS1115Driver
+            return ADS1115Driver()
+        except Exception as e:
+            print(f"[ERROR] Could not initialize ADS1115 driver: {e}")
             sys.exit(1)
-        return ADS1115Driver()
+
     else:
         raise ValueError(f"Unknown data source: {source}")
+
+
+def get_telemetry_server(no_ws: bool):
+    if no_ws:
+        return None
+    try:
+        from edge_system.telemetry_server import TelemetryServer
+        ws_server = TelemetryServer()
+        ws_server.start()
+        return ws_server
+    except ImportError:
+        print("[NOTICE] websockets package not installed. Running in standalone console mode.")
+        return None
 
 
 def main():
@@ -87,10 +101,7 @@ def main():
     )
     infer_engine = EdgeInferenceEngine(threshold=args.threshold)
 
-    ws_server = None
-    if not args.no_ws:
-        ws_server = TelemetryServer()
-        ws_server.start()
+    ws_server = get_telemetry_server(args.no_ws)
 
     sample_count = 0
     total_beats = 0
