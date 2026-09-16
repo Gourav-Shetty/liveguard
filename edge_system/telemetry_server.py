@@ -18,15 +18,19 @@ class TelemetryServer:
         try:
             await websocket.wait_closed()
         finally:
-            self.connected_clients.remove(websocket)
+            self.connected_clients.discard(websocket)
+
+    async def _serve(self):
+        self.loop = asyncio.get_running_loop()
+        async with websockets.serve(self._register, self.host, self.port):
+            await asyncio.Future()
 
     def start(self):
         def run_loop():
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            start_server = websockets.serve(self._register, self.host, self.port)
-            self.loop.run_until_complete(start_server)
-            self.loop.run_forever()
+            try:
+                asyncio.run(self._serve())
+            except Exception:
+                pass
 
         self.thread = threading.Thread(target=run_loop, daemon=True)
         self.thread.start()
@@ -37,4 +41,7 @@ class TelemetryServer:
 
         message = json.dumps(payload)
         for ws in list(self.connected_clients):
-            asyncio.run_coroutine_threadsafe(ws.send(message), self.loop)
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send(message), self.loop)
+            except Exception:
+                pass
