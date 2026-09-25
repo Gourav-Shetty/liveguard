@@ -100,8 +100,6 @@ jobs:
     name: Test (Windows, Python 3.11)
     runs-on: windows-latest
     timeout-minutes: 30
-    env:
-      LIVEGUARD_DATA_DIR: ${{ runner.temp }}\lg_ci_win
     defaults:
       run:
         shell: pwsh
@@ -134,9 +132,14 @@ jobs:
         run: python -m unittest discover -s tests -t .
 
       - name: Prepare feeder auth store
+        # ${{ runner.temp }} is not available at job-level env, so derive
+        # the dir from the runner's native RUNNER_TEMP and publish it to
+        # subsequent steps via GITHUB_ENV.
         run: |
-          Remove-Item -Recurse -Force $env:LIVEGUARD_DATA_DIR -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force $env:LIVEGUARD_DATA_DIR | Out-Null
+          $dir = Join-Path $env:RUNNER_TEMP "lg_ci_win"
+          Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          "LIVEGUARD_DATA_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Start harness feeder
         run: |
