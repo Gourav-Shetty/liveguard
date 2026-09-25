@@ -1,0 +1,18 @@
+# Workstation / training / docs dependencies (LiveGuard-EHMS)
+# For the Raspberry Pi edge runtime only, use backend/requirements.txt instead.
+
+# --- Model training & evaluation ---
+torch>=2.0
+numpy>=1.24.0
+scikit-learn>=1.2
+pandas>=2.0
+scipy>=1.10.0
+
+# --- Federated learning (Flower) ---
+# The FL app (training/quickstart-pytorch/pyproject.toml) additionally pins
+# flwr[simulation]>=1.28.0; this entry covers `flwr run` / ad-hoc FL usage.
+flwr>=1.28.0
+
+# --- Report & plot generation ---
+matplotlib>=3.7
+python-docx>=1.1

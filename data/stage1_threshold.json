@@ -1,0 +1,12 @@
+{
+  "threshold": 0.024567751213908195,
+  "target_recall": 0.95,
+  "val_pr_auc": 0.7702553821287274,
+  "val_auc": 0.8447833781519896,
+  "test_auc": 0.7849893097615184,
+  "test_pr_auc": 0.3742822118147951,
+  "test_precision_abnormal": 0.1341222879684418,
+  "test_recall_abnormal": 0.9691211401425178,
+  "model_file": "stage1_cnn_centralized.pth",
+  "timestamp": "2026-09-25T17:08:26.448815+00:00"
+}

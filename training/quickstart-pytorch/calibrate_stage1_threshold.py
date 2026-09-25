@@ -1,10 +1,11 @@
 """
-Run this once after `flwr run .` finishes and a stage1_cnn_*.pth file
-has been saved.
+Run this once after training — `flwr run .` (federated) or
+train_centralized.py (centralized) — and a stage1_cnn_*.pth file has been
+saved in data/.
 
-Loads the federated model's weights, sweeps thresholds against the
-validation set (maximizing precision for TARGET_RECALL), and
-appends a row of results to a CSV.
+Loads the model's weights, sweeps thresholds against the validation set
+(maximizing precision for TARGET_RECALL), appends a row of results to a CSV,
+and writes data/stage1_threshold.json for backend/config.py to consume.
 """
 
 import argparse
@@ -85,15 +86,30 @@ def append_result_row(row: dict):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-file", default="stage1_cnn.pth",
-                        help="Filename (within DATA_DIR) of the saved model")
+    parser.add_argument("--model-file", default=None,
+                        help="Filename (within DATA_DIR) of the saved model. "
+                             "Default: stage1_cnn.pth (FL), falling back to "
+                             "stage1_cnn_centralized.pth")
     parser.add_argument("--mu", type=float, default=None, help="proximal_mu used for this run, for logging")
     parser.add_argument("--seed", type=int, default=None, help="seed used for this run, for logging")
     parser.add_argument("--num-supernodes", type=int, default=None, help="num-supernodes used for this run, for logging")
     args = parser.parse_args()
 
-    model_path = os.path.join(DATA_DIR, args.model_file)
-    print(f"Loading federated model from {model_path}...")
+    model_file = args.model_file
+    if model_file is None:
+        for candidate in ("stage1_cnn.pth", "stage1_cnn_centralized.pth"):
+            if os.path.exists(os.path.join(DATA_DIR, candidate)):
+                model_file = candidate
+                break
+        if model_file is None:
+            raise SystemExit(
+                f"No stage1 model found in {DATA_DIR}. Train first "
+                f"(training/quickstart-pytorch/train_centralized.py or `flwr run .`) "
+                f"or pass --model-file."
+            )
+
+    model_path = os.path.join(DATA_DIR, model_file)
+    print(f"Loading model from {model_path}...")
     model = Net().to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
 
@@ -143,7 +159,7 @@ def main():
 
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "model_file": args.model_file,
+        "model_file": model_file,
         "proximal_mu": args.mu,
         "seed": args.seed,
         "num_supernodes": args.num_supernodes,

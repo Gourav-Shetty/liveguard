@@ -18,7 +18,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
   * **Inference Latency**: **~1.5 ms** per heartbeat on a 1.4 GHz ARM Cortex-A53.
   * **RAM Footprint**: **~120 MB total system memory** (leaving >850 MB free on a 1 GB Pi 3B+).
   * **Model Size**: Compressed to just **13.8 KB** (`stage1_weights.npz`).
-* **Real-Time Streaming DSP**: Sample-by-sample 0.5–45 Hz Butterworth IIR bandpass filtering, notch filtering, Pan-Tompkins adaptive QRS detection, dynamic thresholding, and continuous Heart Rate (BPM) calculation.
+* **Real-Time Streaming DSP**: Sample-by-sample 0.5–40 Hz Butterworth IIR bandpass filtering, notch filtering, Pan-Tompkins adaptive QRS detection, dynamic thresholding, and continuous Heart Rate (BPM) calculation.
 * **Modular Multi-Source Hardware Drivers**:
   * **Physical Hardware**: AD8232 ECG sensor via ADS1115 (I2C 16-bit ADC), MCP3008 (SPI 10-bit ADC), or Arduino Serial bridge.
   * **Clinical Replay**: Built-in streaming driver to replay real patient recordings from the MIT-BIH Arrhythmia Database at precise sampling rates (360 Hz).
@@ -27,6 +27,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
 * **Two-Stage Arrhythmia Classification**:
   * **Stage 1 (Binary Anomaly Gate)**: Rapid anomaly filtering (Normal vs. Arrhythmia) with calibrated 96%+ abnormal beat recall.
   * **Stage 2 (Multiclass Diagnostic Classifier)**: Extensible AAMI EC57 5-class categorization (Normal `N`, Supraventricular `S`, Ventricular `V`, Fusion `F`, Unknown `Q`).
+    * *Roadmap*: training and export scripts ship under [`training/`](training/) (`train_stage2_multiclass.py`, `export_stage2_to_npz.py`), but Stage 2 is **not yet wired into the live edge pipeline** — `python -m backend.run_edge` runs the Stage 1 binary gate only.
 
 ---
 
@@ -36,20 +37,20 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
                                   LIVEGUARD PIPELINE
                                   
  ┌───────────────────────────────────────────────────────────────────────────────┐
- │                            DATA ACQUISITION                                  │
- │   AD8232 Sensor (Skin Leads)   ───>  ADS1115 / MCP3008 ADC (SPI/I2C)         │
- │   MIT-BIH Database Replay     ───>  Clinical Stream Driver (360 Hz)          │
+ │                            DATA ACQUISITION                                   │
+ │   AD8232 Sensor (Skin Leads)   ───>  ADS1115 / MCP3008 ADC (SPI/I2C)          │
+ │   MIT-BIH Database Replay     ───>  Clinical Stream Driver (360 Hz)           │
  └───────────────────────────────────────┬───────────────────────────────────────┘
                                          │ Raw Voltage Sample (every 2.7 ms)
                                          ▼
  ┌───────────────────────────────────────────────────────────────────────────────┐
  │                       REAL-TIME SIGNAL PROCESSING (DSP)                       │
- │   • Butterworth IIR Bandpass Filter (0.5 Hz - 45 Hz)                          │
- │   • Baseline Wander & 50/60 Hz Powerline Noise Rejection                      │
+ │   • Butterworth IIR Bandpass Filter (0.5 Hz - 40 Hz)                          │
+ │   • Baseline Wander & 50 Hz Powerline Noise Rejection                         │
  │   • Pan-Tompkins QRS Derivative & Adaptive Window Integration                 │
  │   • Dynamic R-Peak Trigger & Continuous Heart Rate (BPM) Estimation           │
  └───────────────────────────────────────┬───────────────────────────────────────┘
-                                         │ 180-Sample Beat Window [-72 to +108]
+                                         │ 180-Sample Beat Window [-70 to +110]
                                          ▼
  ┌───────────────────────────────────────────────────────────────────────────────┐
  │                      STAGE 1: EDGE INFERENCE (Pure-NumPy)                     │
@@ -73,7 +74,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
  ┌───────────────────────────────────────────────────────────────────────────────┐
  │                     TELEMETRY & VISUALIZATION SERVER                          │
  │   • Asynchronous WebSocket Server (port 8765)                                 │
- │   • HTML5 Canvas Oscilloscope Dashboard (frontend/test_viewer.html)  │
+ │   • HTML5 Canvas Oscilloscope Dashboard (frontend/test_viewer.html)           │
  │   • Real-Time Synchronized Waveform & Anomaly Badges                          │
  └───────────────────────────────────────┬───────────────────────────────────────┘
                                          │ Local Ring Buffer of Detected Beats
@@ -154,11 +155,20 @@ python3 -m backend.run_edge --source ARDUINO --port /dev/ttyUSB0
 
 ---
 
+## 📦 Requirements
+
+* **Edge runtime (Raspberry Pi / edge host)** — [`backend/requirements.txt`](backend/requirements.txt): `pyserial`, `numpy`, `scipy`, `websockets`, `smbus2`.
+  * On the Pi the Quick Start above installs the core numeric/websocket stack from `apt` (`python3-numpy python3-scipy python3-websockets`); use `pip install -r backend/requirements.txt` for the full set — `pyserial` (Arduino serial bridge) and `smbus2` (ADS1115 I2C) are only needed for those physical sensor sources.
+* **Workstation (training, federated learning, reports & docs)** — [`training/requirements.txt`](training/requirements.txt): `torch`, `flwr`, `scikit-learn`, `pandas`, `matplotlib`, `python-docx`.
+  * The Flower FL app additionally pins its own dependencies in [`training/quickstart-pytorch/pyproject.toml`](training/quickstart-pytorch/pyproject.toml) (`pip install -e .`, see the Federated Learning section below).
+
+---
+
 ## 💻 Live Web Visualizer (HTML5 Oscilloscope)
 
 LiveGuard includes an in-browser live oscilloscope in [`frontend/test_viewer.html`](frontend/test_viewer.html).
 
-1. Ensure `run_edge.py` is running on the Pi (or laptop).
+1. Ensure the edge pipeline is running on the Pi (or laptop): `python -m backend.run_edge`.
 2. Open [`frontend/test_viewer.html`](frontend/test_viewer.html) in any modern browser (Chrome, Edge, Firefox, Safari).
 3. Set the WebSocket URL:
    * Local: `ws://localhost:8765`
@@ -263,6 +273,27 @@ proximal-mu = 0.0 # set > 0 for FedProx
 * **Memory Footprint**: **~120 MB total system RAM**
 * **Stage 1 Binary Detection Recall**: **96.9%** on MIT-BIH test arrhythmia beats.
 
+### Operating Threshold & Precision (from `data/fl_experiment_results.csv`)
+
+* Threshold calibration picks the operating threshold that maximizes precision while holding abnormal recall ≥ 95% on validation. The logged run selects **threshold `0.0246`** (`chosen_threshold`), which yields **13.41% precision** on abnormal test beats (`test_precision_abnormal = 0.1341`) at **96.91% recall** (`test_recall_abnormal = 0.9691`).
+* Every row currently in the CSV is for the centralized model (`model_file = stage1_cnn_centralized.pth`, `proximal_mu = N/A (Centralized)`); the Flower FL run has **not** been appended yet, so an FL-specific threshold/precision pair is not recorded in the CSV.
+
+---
+
+## 🧪 Tests
+
+Two regression suites cover the backend pipeline and the browser dashboard:
+
+* **Python suite — 33 tests** (pipeline, telemetry server, authentication, rate limits):
+  ```bash
+  python -m unittest discover -s tests -t .
+  ```
+* **Node frontend harness — 26 checks** (headless viewer auth + broadcast checks; runs the real inline script of [`frontend/test_viewer.html`](frontend/test_viewer.html) outside the browser):
+  ```bash
+  node tests/frontend_harness.js ws://127.0.0.1:8766
+  ```
+  A `TelemetryServer` must already be running — copy the start command from the usage comment at the top of [`tests/frontend_harness.js`](tests/frontend_harness.js). The live-broadcast checks only pass while a pipeline is feeding that same server; an idle server passes the auth checks only.
+
 ---
 
 ## 📁 Repository Structure
@@ -304,6 +335,7 @@ LiveGuard/
 │   ├── build_mitbih_splits.py         # Preprocesses raw MIT-BIH records into splits
 │   ├── export_stage2_to_npz.py        # Exports Stage 2 multiclass weights
 │   ├── export_weights_to_npz.py       # Fuses BatchNorm and exports Stage 1 weights
+│   ├── requirements.txt               # Workstation / training dependencies
 │   └── train_stage2_multiclass.py     # Stage 2 5-class AAMI arrhythmia classifier
 │
 ├── docs/                              # Guides & documentation generators
@@ -318,6 +350,7 @@ LiveGuard/
 │   ├── mitbih_train_ready.npz         # 38-patient non-IID training split
 │   ├── mitbih_val_ready.npz           # Validation patient split
 │   ├── stage1_cnn_centralized.pth     # Centralized PyTorch checkpoint
+│   ├── stage1_threshold.json          # Calibrated anomaly threshold (auto-loaded by backend/config)
 │   └── stage1_weights.npz             # Fused NumPy weights
 │
 ├── archive/                           # Raw MIT-BIH waveform database (gitignored, not committed)
@@ -341,4 +374,4 @@ LiveGuard/
 ---
 
 ## 📜 License
-This project is licensed under the MIT License — see the [LICENSE](training/quickstart-pytorch/LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
