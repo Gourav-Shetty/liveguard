@@ -41,6 +41,11 @@ jobs:
         with:
           node-version: "22"
 
+      # Zero-cost syntax gate: catch a broken harness before the slower
+      # Python steps (validates whatever version is checked out).
+      - name: Frontend harness syntax check
+        run: node --check tests/frontend_harness.js
+
       - name: Install runtime dependencies
         run: python -m pip install -r backend/requirements.txt
 
@@ -73,6 +78,12 @@ jobs:
 
       - name: Frontend harness
         run: node tests/frontend_harness.js ws://127.0.0.1:8766
+
+      # feeder.log is only cat-ed on the readiness-failure path above;
+      # dump it on ANY failure so harness errors are debuggable too.
+      - name: Dump feeder log on failure
+        if: failure()
+        run: cat feeder.log || true
 
       - name: Stop feeder
         if: always()

@@ -1,5 +1,6 @@
 """Hardening regression tests (stdlib unittest): fail-closed TLS, slow-client
-isolation, broadcast fan-out, and registration caps.
+isolation, broadcast fan-out, registration caps, session-message budgets,
+map-sweep throttling, server stop(), and connection/bind cleanup.
 
 Sections:
   A. TLS fail-closed   - LIVEGUARD_TLS_CERT/KEY misconfiguration must never
@@ -8,6 +9,8 @@ Sections:
   C. Fan-out           - one serialization, per-client isolation, plus an
                          end-to-end broadcast over a real server
   D. Registration caps - per-connection and per-IP success budgets
+  E. Session budget    - bad-message cap (1008), stop(), sweep throttling,
+                         auth-timeout cleanup, bind failure survivability
 
 LIVEGUARD_DATA_DIR is pointed at a throwaway temp directory BEFORE
 backend.config is imported (only when no earlier test module already set it),
@@ -54,6 +57,7 @@ from backend import telemetry_server as ts_module  # noqa: E402
 from backend.auth.db import UserStore  # noqa: E402
 from backend.auth.service import AuthService  # noqa: E402
 from backend.telemetry_server import TelemetryServer  # noqa: E402
+from websockets.exceptions import ConnectionClosed  # noqa: E402
 from websockets.sync.client import connect  # noqa: E402
 
 GOOD_PASSWORD = "s3cret-pass"  # 11 chars -> satisfies the 8-128 rule
@@ -103,6 +107,24 @@ def wait_until_ready(url: str, timeout: float = 5.0) -> None:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.05)
+
+
+def recv_close(ws, timeout: float = 5.0):
+    """Read until the connection closes; return (close_code, close_reason)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("connection was not closed within %.1fs" % timeout)
+        try:
+            ws.recv(timeout=remaining)
+        except ConnectionClosed as exc:
+            close = exc.rcvd if exc.rcvd is not None else exc.sent
+            if close is None:
+                return (None, "")
+            return (close.code, close.reason)
+        except TimeoutError:
+            raise AssertionError("connection was not closed within %.1fs" % timeout)
 
 
 def run_bounded(coro, timeout: float = 15.0):
@@ -179,6 +201,24 @@ class FakeWebSocket:
         self.closes.append((code, reason))
 
 
+class QueuedWebSocket(FakeWebSocket):
+    """Fake socket whose recv() replays a scripted sequence of frames.
+
+    Reading past the end of the script raises immediately instead of
+    blocking, so a regression fails fast with a clear message rather than
+    tripping the run_bounded() watchdog.
+    """
+
+    def __init__(self, messages):
+        super().__init__()
+        self._inbox = list(messages)
+
+    async def recv(self):
+        if not self._inbox:
+            raise RuntimeError("recv() called after the scripted messages ran out")
+        return self._inbox.pop(0)
+
+
 # ----------------------------------------------------------------------
 # Shared fixture: one TelemetryServer + throwaway store per test
 # ----------------------------------------------------------------------
@@ -222,6 +262,12 @@ class _ServerFixture(unittest.TestCase):
         self.url = "ws://127.0.0.1:%d" % self.server.port
 
     def tearDown(self):
+        # Stop the server FIRST (safe/no-op when it was never started): the
+        # serving thread must be gone before the addCleanup rmtree below runs.
+        try:
+            self.server.stop()
+        except (RuntimeError, AttributeError):  # pragma: no cover - defensive
+            pass
         # Close the sqlite handle before the addCleanup rmtree below runs
         # (Windows cannot delete an open database file).
         try:
@@ -518,6 +564,336 @@ class RegisterCapTests(_ServerFixture):
         self.assertFalse(errors, errors)
         self.assertEqual(len(granted), 5, results)
         self.assertEqual(len(denied), 15, results)
+
+
+# ======================================================================
+# E. Session-phase budget, sweep throttling, stop(), cleanup, bind failure
+# ======================================================================
+class SessionBudgetTests(_ServerFixture):
+    """Authenticated clients cannot earn error replies forever (item 2).
+
+    logout is the ONLY recognized session-phase message and it is terminal
+    (it ends the session), so there is no non-terminal recognized message to
+    drive an in-session reset on the wire -- the reset is therefore asserted
+    at unit level (conn_state counter), the cap end-to-end over a real socket.
+    """
+
+    def test_ten_junk_frames_close_session_with_1008(self):
+        ok, msg = self.auth.register("session_budget_user", GOOD_PASSWORD)
+        self.assertTrue(ok, msg)
+        self.server.start()
+        wait_until_ready(self.url)
+        with connect(self.url, open_timeout=5) as ws:
+            send_json(ws, {"type": "auth", "username": "session_budget_user",
+                           "password": GOOD_PASSWORD})
+            reply = recv_json(ws, timeout=5.0)
+            self.assertIsNotNone(reply, "no reply to auth")
+            self.assertEqual(reply.get("type"), "auth_ok", reply)
+            # 10 well-formed frames of an unrecognized type, back to back.
+            for _ in range(10):
+                ws.send('{"type": "ping"}')
+            replies = []
+            code = reason = None
+            deadline = time.monotonic() + 5.0
+            while True:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0.0, "connection was not closed")
+                try:
+                    raw = ws.recv(timeout=remaining)
+                except ConnectionClosed as exc:
+                    close = exc.rcvd if exc.rcvd is not None else exc.sent
+                    if close is not None:
+                        code, reason = close.code, close.reason
+                    break
+                replies.append(json.loads(raw))
+            # The first 9 junk frames each earn exactly one error reply; the
+            # 10th closes the connection instead of earning another one.
+            self.assertEqual(len(replies), 9, replies)
+            for reply in replies:
+                self.assertEqual(reply.get("type"), "error", reply)
+                self.assertEqual(reply.get("code"), "bad_message", reply)
+            self.assertEqual(code, 1008, "close code %r reason %r" % (code, reason))
+            self.assertEqual(reason, "too many bad messages")
+
+    def test_recognized_message_resets_bad_message_budget(self):
+        # Unit level (see class docstring): the counter lives in the
+        # per-connection conn_state, so it must survive logout -> re-auth
+        # cycles WITHOUT accumulating, while 10 consecutive bad frames in one
+        # session still close with 1008.
+        junk = '{"type": "ping"}'
+        logout = json.dumps({"type": "logout"})
+        conn_state = {"register_successes": 0}
+
+        first = QueuedWebSocket([junk] * 9 + [logout])
+        result = run_bounded(self.server._session_phase(first, conn_state))
+        self.assertEqual(result, "logged_out")
+        self.assertEqual(conn_state.get("bad_messages"), 0,
+                         "logout must reset the bad-message budget")
+        self.assertEqual(first.closes, [])
+
+        # Second session on the SAME connection: 9 more junk frames. Without
+        # the reset these would be 18 consecutive and the session would have
+        # been closed immediately.
+        second = QueuedWebSocket([junk] * 9 + [logout])
+        result = run_bounded(self.server._session_phase(second, conn_state))
+        self.assertEqual(result, "logged_out",
+                         "bad-message budget leaked across sessions")
+        self.assertEqual(second.closes, [])
+
+        # ...and the cap itself: 10 consecutive in one session -> 1008.
+        third = QueuedWebSocket([junk] * 10 + [logout])
+        result = run_bounded(self.server._session_phase(third, conn_state))
+        self.assertEqual(result, "closed")
+        self.assertEqual(third.closes, [(1008, "too many bad messages")])
+        self.assertEqual(conn_state.get("bad_messages"),
+                         ts_module.MAX_SESSION_BAD_MESSAGES)
+
+
+class SweepThrottleTests(_ServerFixture):
+    """Full-map expiry sweeps are throttled; per-IP windows stay exact (6)."""
+
+    def test_attempt_sweep_throttled_but_queried_ip_expires_exactly(self):
+        with mock.patch.object(ts_module, "MAX_IP_AUTH_FAILURES", 2), \
+                mock.patch.object(ts_module, "IP_FAILURE_WINDOW_SECONDS", 0.05):
+            self.assertTrue(self.server._reserve_ip_attempt("8.8.8.8"))
+            self.assertTrue(self.server._reserve_ip_attempt("8.8.8.8"))
+            self.assertFalse(self.server._reserve_ip_attempt("8.8.8.8"))
+            time.sleep(0.15)  # 8.8.8.8's window elapses
+            # Reserving for a DIFFERENT ip must not sweep the whole map...
+            self.assertTrue(self.server._reserve_ip_attempt("4.4.4.4"))
+            self.assertIn(
+                "8.8.8.8", self.server._ip_failures,
+                "full-map sweep must be throttled to at most once per %.0fs"
+                % ts_module.IP_SWEEP_INTERVAL_SECONDS,
+            )
+            # ...but the queried ip's own window is expiry-filtered exactly.
+            self.assertTrue(self.server._reserve_ip_attempt("8.8.8.8"))
+
+    def test_registration_sweep_throttled_but_queried_ip_expires_exactly(self):
+        with mock.patch.object(ts_module, "MAX_IP_REGISTER_SUCCESSES", 2), \
+                mock.patch.object(ts_module, "IP_REGISTER_WINDOW_SECONDS", 0.05):
+            self.assertTrue(self.server._reserve_ip_registration("9.9.9.1"))
+            self.assertTrue(self.server._reserve_ip_registration("9.9.9.1"))
+            self.assertFalse(self.server._reserve_ip_registration("9.9.9.1"))
+            time.sleep(0.15)  # 9.9.9.1's window elapses
+            self.assertTrue(self.server._reserve_ip_registration("9.9.9.2"))
+            self.assertIn(
+                "9.9.9.1", self.server._ip_reg_successes,
+                "full-map sweep must be throttled to at most once per %.0fs"
+                % ts_module.IP_SWEEP_INTERVAL_SECONDS,
+            )
+            self.assertTrue(self.server._reserve_ip_registration("9.9.9.1"))
+
+
+class ServerStopTests(_ServerFixture):
+    """stop(): joins the serving thread, frees the port, idempotent (7)."""
+
+    def test_stop_is_safe_when_never_started(self):
+        self.server.stop()  # no thread, no future -> no-op
+        self.server.stop()  # idempotent
+        self.assertIsNone(self.server.thread)
+
+    def test_stop_joins_thread_and_releases_port(self):
+        ok, msg = self.auth.register("stop_user", GOOD_PASSWORD)
+        self.assertTrue(ok, msg)
+        self.server.start()
+        wait_until_ready(self.url)
+        with connect(self.url, open_timeout=5) as ws:
+            send_json(ws, {"type": "auth", "username": "stop_user",
+                           "password": GOOD_PASSWORD})
+            reply = recv_json(ws, timeout=5.0)
+            self.assertIsNotNone(reply, "no reply to auth")
+            self.assertEqual(reply.get("type"), "auth_ok", reply)
+
+            # Stop WITH a live authenticated connection: the close handshake
+            # runs on websockets' side, the handler must still finish.
+            self.server.stop()
+            self.assertIsNotNone(self.server.thread)
+            self.assertFalse(self.server.thread.is_alive(),
+                             "stop() must join the serving thread")
+
+        # No listener remains: a fresh connect is refused...
+        with self.assertRaises(OSError):
+            with connect(self.url, open_timeout=2):
+                pass
+        # ...and the port can be bound again. SO_REUSEADDR only excuses
+        # TIME_WAIT sockets left by the connections above; on Windows an
+        # actively listening socket would still block this bind.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", self.server.port))
+        finally:
+            probe.close()
+        # stop() again: idempotent after a full shutdown.
+        self.server.stop()
+        self.assertFalse(self.server.thread.is_alive())
+
+
+class ConnectionCleanupTests(_ServerFixture):
+    """Auth timeouts must release every per-connection entry (8c)."""
+
+    def _wait_for(self, predicate, what: str, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.05)
+        self.fail("%s did not happen within %.1fs" % (what, timeout))
+
+    def test_auth_timeout_cleans_up_after_three_cycles(self):
+        ok, msg = self.auth.register("cleanup_user", GOOD_PASSWORD)
+        self.assertTrue(ok, msg)
+        self.server.start()
+        wait_until_ready(self.url)
+
+        # Sanity: an authenticated connection IS tracked while open...
+        with connect(self.url, open_timeout=5) as ws:
+            send_json(ws, {"type": "auth", "username": "cleanup_user",
+                           "password": GOOD_PASSWORD})
+            reply = recv_json(ws, timeout=5.0)
+            self.assertIsNotNone(reply, "no reply to auth")
+            self.assertEqual(reply.get("type"), "auth_ok", reply)
+            self.assertEqual(len(self.server.connected_clients), 1)
+        self._wait_for(lambda: not self.server.connected_clients,
+                       "authed client cleanup")
+
+        # ...then three connect-without-auth cycles. AUTH_TIMEOUT_SECONDS is
+        # read at _auth_phase entry, so the patch applies to every connection
+        # opened inside this block (proven by the fast close below).
+        with mock.patch.object(ts_module, "AUTH_TIMEOUT_SECONDS", 0.3):
+            for cycle in range(3):
+                with connect(self.url, open_timeout=5) as ws:
+                    started = time.monotonic()
+                    code, reason = recv_close(ws, timeout=3.0)
+                    elapsed = time.monotonic() - started
+                    self.assertEqual(code, 1008, "cycle %d: %r" % (cycle, reason))
+                    self.assertEqual(reason, "authentication timeout")
+                    self.assertLess(elapsed, 2.0,
+                                    "patched auth timeout not in effect (%.2fs)"
+                                    % elapsed)
+
+        def settled():
+            return (not self.server.connected_clients
+                    and not self.server._slow_clients)
+
+        self._wait_for(settled, "handler cleanup after auth timeouts")
+        self.assertEqual(set(self.server.connected_clients), set())
+        self.assertEqual(set(self.server._slow_clients), set())
+
+
+class BindFailureTests(_ServerFixture):
+    """A taken port must fail cleanly and stop() stay safe (8d)."""
+
+    def test_start_on_taken_port_fails_and_stop_is_safe(self):
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                # Windows: without this, an SO_REUSEADDR bind elsewhere could
+                # squat on the same port. Set BEFORE bind, as documented.
+                blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            blocker.bind(("127.0.0.1", 0))  # bound but NOT listening
+            port = blocker.getsockname()[1]
+
+            server = TelemetryServer(host="127.0.0.1", port=port, auth=self.auth)
+            # Capture the expected "telemetry server failed" log so the
+            # deliberate bind failure does not spam the suite output -- and
+            # assert the failure was actually reported, not swallowed.
+            with self.assertLogs("backend.telemetry_server", level="ERROR") as logs:
+                server.start()
+                # The bind fails inside _serve, so the thread must die on its own.
+                deadline = time.monotonic() + 3.0
+                while server.thread.is_alive() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            self.assertFalse(server.thread.is_alive(),
+                             "serving thread survived a bind failure")
+            self.assertTrue(
+                any("telemetry server failed" in line for line in logs.output),
+                logs.output,
+            )
+            # No listener: a websocket connect must fail (refused -> OSError).
+            with self.assertRaises(OSError):
+                with connect("ws://127.0.0.1:%d" % port, open_timeout=2):
+                    pass
+            # stop() after the fact is safe and idempotent.
+            server.stop()
+            self.assertFalse(server.thread.is_alive())
+        finally:
+            blocker.close()
+
+
+# ======================================================================
+# F. Refund-on-raise: a broken store must not leak rate-limit budget
+# ======================================================================
+class RefundOnRaiseTests(_ServerFixture):
+    """Reserve-before-attempt slots come back when the store RAISES.
+
+    The register/authenticate calls run in asyncio.to_thread and can raise
+    (sqlite3.OperationalError, disk full, ...). Without the refund the
+    per-IP caps would silently shrink for the rest of the window on every
+    such incident; these tests force the exception and assert the slot
+    returns while the connection still dies via the handler catch-all.
+    """
+
+    def test_register_raise_refunds_ip_registration_slot(self):
+        self.server.start()
+        wait_until_ready(self.url)
+        with mock.patch.object(ts_module, "MAX_IP_REGISTER_SUCCESSES", 2):
+            # Occupy slot 1 with a real success.
+            with connect(self.url, open_timeout=5) as conn1:
+                send_json(conn1, {"type": "register", "username": "refund_ok",
+                                  "password": GOOD_PASSWORD})
+                reply = recv_json(conn1, timeout=5.0)
+                self.assertEqual((reply or {}).get("type"), "register_ok", reply)
+            self.assertEqual(
+                len(self.server._ip_reg_successes.get("127.0.0.1", [])), 1)
+
+            # This attempt reserves slot 2, then the store raises: the slot
+            # must come back and the handler catch-all must kill the socket.
+            with mock.patch.object(self.auth, "register",
+                                   side_effect=RuntimeError("boom")):
+                with connect(self.url, open_timeout=5) as conn2:
+                    send_json(conn2, {"type": "register",
+                                      "username": "refund_boom",
+                                      "password": GOOD_PASSWORD})
+                    recv_close(conn2, timeout=5.0)
+
+            # Refunded: still exactly one stamp, no account was created.
+            self.assertEqual(
+                len(self.server._ip_reg_successes.get("127.0.0.1", [])), 1,
+                "raised register attempt leaked its IP reservation",
+            )
+            self.assertIsNone(self.store.get_user("refund_boom"))
+            # ...and the freed slot is genuinely usable again (cap = 2).
+            with connect(self.url, open_timeout=5) as conn3:
+                send_json(conn3, {"type": "register", "username": "refund_later",
+                                  "password": GOOD_PASSWORD})
+                reply = recv_json(conn3, timeout=5.0)
+                self.assertEqual((reply or {}).get("type"), "register_ok", reply)
+            self.assertEqual(
+                len(self.server._ip_reg_successes.get("127.0.0.1", [])), 2)
+
+    def test_authenticate_raise_refunds_attempt_slot(self):
+        self.server.start()
+        wait_until_ready(self.url)
+        ok, msg = self.auth.register("refund_user", GOOD_PASSWORD)
+        self.assertTrue(ok, msg)
+        # Fresh budget: no failed attempts recorded for this IP yet.
+        self.assertIsNone(self.server._ip_failures.get("127.0.0.1"))
+
+        with mock.patch.object(self.auth, "authenticate",
+                               side_effect=RuntimeError("boom")):
+            with connect(self.url, open_timeout=5) as conn:
+                send_json(conn, {"type": "auth", "username": "refund_user",
+                                 "password": GOOD_PASSWORD})
+                recv_close(conn, timeout=5.0)
+
+        # The reserved attempt slot was refunded all the way back to empty:
+        # _refund_ip_attempt pops the key when the count reaches zero.
+        self.assertIsNone(
+            self.server._ip_failures.get("127.0.0.1"),
+            "raised authenticate leaked its IP attempt reservation",
+        )
 
 
 if __name__ == "__main__":

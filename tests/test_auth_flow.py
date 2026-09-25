@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_DATA_DIR = tempfile.mkdtemp(prefix="liveguard_auth_tests_")
@@ -42,7 +43,7 @@ if REPO_ROOT not in sys.path:
 from backend import config  # noqa: E402
 from backend import telemetry_server as ts_module  # noqa: E402
 from backend.auth.db import UserStore  # noqa: E402
-from backend.auth.service import AuthService  # noqa: E402
+from backend.auth.service import AuthService, SECRET_BYTES  # noqa: E402
 from backend.telemetry_server import TelemetryServer  # noqa: E402
 from websockets.exceptions import ConnectionClosed  # noqa: E402
 from websockets.sync.client import connect  # noqa: E402
@@ -417,8 +418,11 @@ class IPBudgetTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Close the sqlite handle first: on Windows an open budget.db blocks
-        # deletion and ignore_errors=True would silently leak the directory.
+        # Stop the server first (the serving thread must be gone before the
+        # files are released), then close the sqlite handle: on Windows an
+        # open budget.db blocks deletion and ignore_errors=True would
+        # silently leak the directory.
+        cls.server.stop()
         cls.store.close()
         shutil.rmtree(cls.dir, ignore_errors=True)
 
@@ -725,6 +729,58 @@ class AuthServiceTests(unittest.TestCase):
 
 
 # ======================================================================
+# A3. Token-secret recovery
+# ======================================================================
+class SecretRecoveryTests(unittest.TestCase):
+    """A corrupt or empty ``.liveguard_secret`` must be healed on disk.
+
+    backend/auth/service.py _load_secret() warns that returning a
+    non-persisted secret would silently change signing keys on every restart
+    ("all sessions die"); these tests guard that regression: a garbage or
+    empty file must be rewritten as a fresh VALID hex secret, and a token
+    issued after recovery must verify -- both in-process and from a second
+    service instance that re-reads the file.
+    """
+
+    def test_corrupt_or_empty_secret_is_rewritten_as_valid_hex(self):
+        for case, content in (("corrupt", "THIS-IS-NOT-HEX"), ("empty", "")):
+            with self.subTest(case=case):
+                data_dir = tempfile.mkdtemp(prefix="lg_secret_", dir=TMP_DATA_DIR)
+                try:
+                    secret_path = os.path.join(data_dir, ".liveguard_secret")
+                    with open(secret_path, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+
+                    store = UserStore(db_path=os.path.join(data_dir, "users.db"))
+                    try:
+                        with mock.patch.object(config, "DATA_DIR", data_dir):
+                            auth = AuthService(store=store)
+                            ok, msg = auth.register("recover_user", GOOD_PASSWORD)
+                            self.assertTrue(ok, msg)
+                            token = auth.authenticate("recover_user", GOOD_PASSWORD)
+                            self.assertIsInstance(token, str)
+                            self.assertTrue(token, "token issuance failed")
+                            self.assertEqual(auth.verify_token(token), "recover_user")
+                            # A second instance re-reading the healed file must
+                            # accept the same token (restart survival).
+                            fresh = AuthService(store=store)
+                            self.assertEqual(
+                                fresh.verify_token(token), "recover_user"
+                            )
+                    finally:
+                        store.close()
+
+                    # The file on disk is now a valid 32-byte hex secret...
+                    with open(secret_path, encoding="utf-8") as fh:
+                        raw = fh.read().strip()
+                    secret = bytes.fromhex(raw)
+                    self.assertEqual(len(secret), SECRET_BYTES)
+                    self.assertEqual(raw, secret.hex())
+                finally:
+                    shutil.rmtree(data_dir, ignore_errors=True)
+
+
+# ======================================================================
 # B. Wire protocol (real TelemetryServer, free port, real SQLite store)
 # ======================================================================
 class WireProtocolTests(unittest.TestCase):
@@ -747,6 +803,9 @@ class WireProtocolTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # stop() before close(): the serving thread must be joined before
+        # its sqlite file is released (Windows cannot delete an open file).
+        cls.server.stop()
         cls.store.close()
         shutil.rmtree(cls.dir, ignore_errors=True)
 

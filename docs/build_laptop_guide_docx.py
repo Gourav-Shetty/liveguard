@@ -145,6 +145,17 @@ def create_laptop_guide_docx():
         "   python -m backend.run_edge --source MOCK"
     )
 
+    # First-run sign-in / registration overlay (matches the README's
+    # "Live Web Visualizer" flow and terminology).
+    doc.add_paragraph(
+        "First-run sign-in: open frontend/test_viewer.html in your browser and set the URL field to "
+        "ws://localhost:8765, then click Connect. The dashboard shows an authentication overlay and no "
+        "telemetry arrives until you are authenticated. On your very first run no accounts exist yet, so "
+        "switch to the Create account tab and register the first user (registration stays open only until "
+        "that first account exists). On every later run, sign in with the Sign in tab — the live stream "
+        "only starts after authentication."
+    )
+
     # Section 6: Interpreting Output
     add_custom_heading("6. Understanding Terminal Outputs")
     doc.add_paragraph(
@@ -152,7 +163,8 @@ def create_laptop_guide_docx():
         "• Beat Number & Real-time Heart Rate (BPM)\n"
         "• AI Diagnosis: [NORMAL BEAT] (Conf: 98.2%) or [ABNORMAL/ARRHYTHMIA] (Prob: 0.88)\n"
         "• Total Arrhythmia Alerts count\n"
-        "• WebSocket server status streaming at ws://0.0.0.0:8765 for the web dashboard."
+        "• WebSocket server status: the telemetry server binds 0.0.0.0:8765 (all interfaces);\n"
+        "  open the web dashboard at ws://localhost:8765 (or ws://<laptop-ip>:8765 from another device)."
     )
 
     # Section 7: Troubleshooting

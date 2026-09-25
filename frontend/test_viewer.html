@@ -415,10 +415,27 @@
     const TOKEN_KEY = "liveguard_token";
     const USER_KEY = "liveguard_user";
 
+    // Auto-reconnect policy: exponential backoff with jitter so a fleet of
+    // viewers does not stampede a recovering server. The give-up state is
+    // only shown once every scheduled attempt has failed.
+    const RECONNECT_MAX_ATTEMPTS = 5;
+    const RECONNECT_BACKOFF_MS = [2000, 4000, 8000, 16000, 30000]; // capped at 30s
+    function reconnectDelayMs(attempt) {
+      const base = RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length) - 1];
+      return Math.round(base * (0.8 + Math.random() * 0.4));  // +/-20% jitter
+    }
+
     const el = (id) => document.getElementById(id);
 
+    // Hot-path elements resolved once here instead of five
+    // getElementById calls per render frame (see flushStagedDom).
     const canvas = el("ecgCanvas");
     const ctx = canvas.getContext("2d");
+    const valHrEl = el("valHr");
+    const valAlertsEl = el("valAlerts");
+    const diagBadgeEl = el("diagBadge");
+    const diagTitleEl = el("diagTitle");
+    const diagSubEl = el("diagSub");
 
     /* ==========================================================
        Batched "draw on data" rendering
@@ -435,13 +452,18 @@
        idle connection repaints nothing, and beat/HR-only messages
        never touch the canvas. A short mirrored timer keeps the
        flush bounded where rAF does not run (hidden tab, headless
-       harness); whichever fires first clears the other.
+       harness); whichever fires first clears the other. The rAF
+       slot itself is gated by its own flag that is cleared ONLY
+       inside the rAF-delivered wrapper, so a hidden tab (rAF
+       paused while the timer keeps firing) can never accumulate
+       more than one suspended callback.
        ========================================================== */
     const maxPoints = 500;
     const dataBuffer = new Array(maxPoints).fill(0);  // ring buffer: oldest sample lives at bufferHead
     let bufferHead = 0;           // next write slot == oldest sample
 
     let renderScheduled = false;  // a frame callback is already in flight
+    let rafPending = false;       // an rAF wrapper is queued; cleared ONLY inside that wrapper
     let renderTimer = null;       // fallback timer mirroring the rAF
     let waveformDirty = false;    // samples or canvas size changed -> repaint
 
@@ -450,6 +472,7 @@
     let pendingBadge = null;      // {cls,title,sub} staged for the next frame
     let appliedHr = null;         // last values written to the DOM (skip no-op writes)
     let appliedAlerts = null;
+    let appliedBadge = null;      // last {cls,title,sub} written to the DOM
 
     function pushSample(sample) {
       dataBuffer[bufferHead] = sample;
@@ -462,7 +485,18 @@
     function scheduleRender() {
       if (renderScheduled) return;
       renderScheduled = true;
-      requestAnimationFrame(renderFrame);
+      // rAF is suspended in hidden tabs while the 32ms timer below keeps
+      // firing, so gate rAF behind its own flag: only the wrapper that the
+      // rAF itself delivers may clear it. At most ONE rAF callback is ever
+      // in flight -> the hidden-tab queue stays bounded (a single flush on
+      // resume) instead of growing one callback per 32ms tick.
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(function () {
+          rafPending = false;   // cleared only here, inside the rAF delivery
+          renderFrame();
+        });
+      }
       if (renderTimer === null) {
         renderTimer = setTimeout(function () { renderTimer = null; renderFrame(); }, 32);
       }
@@ -484,22 +518,30 @@
     function flushStagedDom() {
       if (pendingHr !== null) {
         if (pendingHr !== appliedHr) {
-          el("valHr").innerHTML = `${pendingHr} <span class="unit">BPM</span>`;
+          valHrEl.innerHTML = `${pendingHr} <span class="unit">BPM</span>`;
           appliedHr = pendingHr;
         }
         pendingHr = null;
       }
       if (pendingAlerts !== null) {
         if (pendingAlerts !== appliedAlerts) {
-          el("valAlerts").innerText = pendingAlerts;
+          valAlertsEl.innerText = pendingAlerts;
           appliedAlerts = pendingAlerts;
         }
         pendingAlerts = null;
       }
       if (pendingBadge !== null) {
-        el("diagBadge").className = pendingBadge.cls;
-        el("diagTitle").innerText = pendingBadge.title;
-        el("diagSub").innerText = pendingBadge.sub;
+        // Same applied-value guard as HR/alerts: identical badge states
+        // (the common case, one staged per beat) cause zero DOM writes.
+        if (appliedBadge === null ||
+            appliedBadge.cls !== pendingBadge.cls ||
+            appliedBadge.title !== pendingBadge.title ||
+            appliedBadge.sub !== pendingBadge.sub) {
+          diagBadgeEl.className = pendingBadge.cls;
+          diagTitleEl.innerText = pendingBadge.title;
+          diagSubEl.innerText = pendingBadge.sub;
+          appliedBadge = pendingBadge;
+        }
         pendingBadge = null;
       }
     }
@@ -545,7 +587,17 @@
       waveformDirty = true;   // assigning width/height wipes the bitmap
       scheduleRender();
     }
-    window.addEventListener("resize", resizeCanvas);
+    // Trailing throttle: a window-drag fires resize on every mouse move and
+    // each fire would realloc the bitmap. At most one realloc per 100ms; the
+    // deferred call reads the live size, so the final size always wins.
+    let resizeTimer = null;
+    window.addEventListener("resize", function () {
+      if (resizeTimer !== null) return;
+      resizeTimer = setTimeout(function () {
+        resizeTimer = null;
+        resizeCanvas();
+      }, 100);
+    });
     // Repaint once when a hidden tab becomes visible again (rAF is
     // paused there, so the dirty flag is still pending).
     window.addEventListener("visibilitychange", function () {
@@ -615,9 +667,12 @@
     }
 
     function setStreamIdle(title, subtitle) {
-      el("diagBadge").className = "diagnosis-badge";
-      el("diagTitle").innerText = title;
-      el("diagSub").innerText = subtitle;
+      diagBadgeEl.className = "diagnosis-badge";
+      diagTitleEl.innerText = title;
+      diagSubEl.innerText = subtitle;
+      // Keep the applied-value model in sync with this direct write so the
+      // staged-badge guard in flushStagedDom cannot skip a needed update.
+      appliedBadge = { cls: "diagnosis-badge", title: title, sub: subtitle };
     }
 
     function showUserBar() {
@@ -664,7 +719,7 @@
         setPending(false);
         setStatus("Connecting to " + currentUrl + " ...");
       } else {
-        setStreamIdle("RECONNECTING", "Attempt " + reconnectAttempts + "/3 - retrying ...");
+        setStreamIdle("RECONNECTING", "Attempt " + reconnectAttempts + "/" + RECONNECT_MAX_ATTEMPTS + " - retrying ...");
       }
       el("btnConnect").innerText = "Connecting...";
       el("statusDot").classList.remove("connected");
@@ -889,6 +944,7 @@
 
       setPending(false);
       setAuthError(null);
+      el("authPass").value = "";   // session established: drop the password from the DOM
       hideOverlay();
       showUserBar();
       updateRetryButton();
@@ -918,15 +974,25 @@
     }
 
     function handleServerError(data) {
+      let reason = (data && data.reason) ? String(data.reason) : "";
+      if (!reason) {
+        reason = (data && data.code === "register_failed") ? "Registration failed." : "Server error.";
+      }
+      // Post-auth {"type":"error"} replies (e.g. bad_message for a frame the
+      // backend rejected) are protocol hiccups, not session failures: log and
+      // leave the healthy, authenticated dashboard alone. Shoving the
+      // sign-in modal over a live stream would clear + focus the password
+      // field for no reason. Pre-auth errors (register_failed, ...) keep the
+      // original overlay behaviour below.
+      if (authed) {
+        console.warn("Server error during live session:", (data && data.code) || "error", "-", reason);
+        return;
+      }
       clearAuthWatchdog();
       authInFlight = false;
       pendingAction = null;
       pendingCreds = null;
 
-      let reason = (data && data.reason) ? String(data.reason) : "";
-      if (!reason) {
-        reason = (data && data.code === "register_failed") ? "Registration failed." : "Server error.";
-      }
       // Lockouts can arrive as {error, code:"register_failed"} too -- record
       // them so handleClose() shows the LOCKED OUT state instead of a generic
       // connection-closed message.
@@ -974,6 +1040,7 @@
       isConnected = false;
       authed = false;               // stop processing stream messages
       discardStagedStream();        // drop staged badges so no late flush can fire
+      pendingCreds = null;          // cannot be consumed after a close (pendingAction survives: the reconnect/resubmit paths below still need it)
       authInFlight = false;
       setPending(false);            // never leave the submit button disabled/spinning
       clearAuthWatchdog();
@@ -1015,24 +1082,24 @@
         return;
       }
 
-      // --- an authenticated session dropped: auto-reconnect (max 3 attempts) ---
+      // --- an authenticated session dropped: auto-reconnect (max 5 attempts, exp. backoff + jitter) ---
       const canResumeSession = (wasAuthed || reconnectingSession) && !!storeGet(TOKEN_KEY);
       if (canResumeSession) {
-        if (reconnectAttempts < 3) {
+        if (reconnectAttempts < RECONNECT_MAX_ATTEMPTS) {
           reconnectAttempts += 1;
           reconnectingSession = true;
-          setStreamIdle("CONNECTION LOST", "Reconnecting (attempt " + reconnectAttempts + "/3) ...");
+          setStreamIdle("CONNECTION LOST", "Reconnecting (attempt " + reconnectAttempts + "/" + RECONNECT_MAX_ATTEMPTS + ") ...");
           reconnectTimer = setTimeout(function () {
             reconnectTimer = null;
             connect(currentUrl, false);
-          }, 2000);
+          }, reconnectDelayMs(reconnectAttempts));
           return;
         }
         reconnectingSession = false;
         setPending(false);
         showOverlay();
         setAuthError("Connection lost");
-        setStatus("Unable to reconnect after 3 attempts - check the server and press Retry connection.");
+        setStatus("Unable to reconnect after " + RECONNECT_MAX_ATTEMPTS + " attempts - check the server and press Retry connection.");
         setStreamIdle("CONNECTION LOST", "Check the server connection");
         return;
       }

@@ -16,7 +16,10 @@
  *   2. node tests/frontend_harness.js ws://127.0.0.1:8766
  *
  * Covered: register -> auto sign-in -> live broadcasts -> logout -> wrong
- * password -> re-login, plus stored-token auto-auth on a fresh page load.
+ * password -> re-login, plus stored-token auto-auth on a fresh page load,
+ * post-auth bad_message resilience (real server round-trip), password
+ * hygiene, the badge write guard, and the dropped-connection auto-reconnect
+ * (attempt badge + jittered first backoff + resumed broadcasts).
  */
 const fs = require("fs");
 const path = require("path");
@@ -81,14 +84,17 @@ function boot(seedStorage) {
   function makeElement(id) {
     const listeners = {};
     const classes = new Set();
-    return {
+    // className writes are counted so checks can prove the viewer's
+    // applied-value guards: an unchanged badge must NOT be rewritten.
+    let classNameValue = "";
+    let classNameWrites = 0;
+    const elm = {
       id,
       hidden: !!INITIAL_HIDDEN[id],
       value: "",
       innerText: id === "authStatus" ? "Not connected" : "",
       innerHTML: id === "valHr" ? '-- <span class="unit">BPM</span>' : "",
       disabled: false,
-      className: "",
       width: 0,
       height: 0,
       parentElement: { clientWidth: 900 },
@@ -110,6 +116,14 @@ function boot(seedStorage) {
       getContext() { return ctxStub; },
       _fire(type, ev) { (listeners[type] || []).forEach((fn) => fn(ev || { preventDefault() {} })); },
     };
+    Object.defineProperty(elm, "className", {
+      get() { return classNameValue; },
+      set(v) { classNameValue = String(v); classNameWrites += 1; },
+      enumerable: true,
+      configurable: true,
+    });
+    elm.classNameWrites = () => classNameWrites;
+    return elm;
   }
   KNOWN_IDS.forEach((id) => { elements[id] = makeElement(id); });
 
@@ -201,6 +215,8 @@ function keySet(obj) {
   check("user bar visible after sign-in", s.elements.userBar.hidden === false, s.elements.userBar.hidden);
   check("user name shown", s.elements.userName.innerText === username, s.elements.userName.innerText);
   check("no auth error shown", s.elements.authError.hidden === true, s.elements.authError.innerText);
+  check("password input is empty after auth_ok",
+    s.elements.authPass.value === "", JSON.stringify(s.elements.authPass.value));
 
   // --- live broadcasts update the UI --------------------------------
   await waitFor(() => !/^--/.test(s.elements.valHr.innerHTML), 6000, "first beat badge update");
@@ -230,6 +246,18 @@ function keySet(obj) {
   const afterLo = frames(s.SENT.slice(framesBeforeLogout + 1));
   check("nothing sent after logout frame",
     s.SENT.length === framesBeforeLogout + 1, JSON.stringify(afterLo));
+
+  // --- a pre-auth server error must STILL surface in the overlay -------
+  // (the socket is gone, so the server cannot deliver this itself: invoke
+  // the script's own message handler exactly as handleMessage would be
+  // called by ws.onmessage with an event carrying the JSON payload.)
+  s.context.handleMessage({
+    data: JSON.stringify({ type: "error", code: "register_failed", reason: "pre-auth server error probe" }),
+  });
+  check("pre-auth server error still shows in the auth overlay",
+    s.elements.authOverlay.hidden === false &&
+      /pre-auth server error probe/.test(s.elements.authError.innerText),
+    "overlay.hidden=" + s.elements.authOverlay.hidden + " authError=" + s.elements.authError.innerText);
 
   // --- wrong password (single attempt) surfaces the server reason ---
   s.elements.authUser.value = username;   // logout() cleared the username field
@@ -266,10 +294,44 @@ function keySet(obj) {
   check("every outbound frame is register/auth/logout", shapesOk,
     JSON.stringify(all.map((f) => f.obj)));
 
+  // --- a REAL post-auth bad_message reply must not hijack the session --
+  // The backend answers any unexpected client frame with
+  // {type:"error", code:"bad_message"} (see tests/test_auth_flow.py
+  // test_09a) and keeps the socket open, so we probe the genuine server
+  // path: wrap ws.onmessage to capture frames exactly as the socket
+  // delivers them, send {"type":"ping"} through the recording socket, and
+  // assert the viewer leaves the live dashboard alone when the reply hits.
+  vm.runInContext(
+    "window.__raw = []; window.__prevOnMessage = ws.onmessage;" +
+      "ws.onmessage = function (ev) { window.__raw.push(String(ev.data)); window.__prevOnMessage(ev); };",
+    s.context);
+  vm.runInContext('ws.send(JSON.stringify({ type: "ping" }));', s.context);
+  const sawBadMessage = () =>
+    (s.context.window.__raw || []).some((raw) => {
+      try {
+        const o = JSON.parse(raw);
+        return o && o.type === "error" && o.code === "bad_message";
+      } catch (e) { return false; }
+    });
+  await waitFor(sawBadMessage, 6000, "bad_message reply for the junk frame");
+  check("server replied to the junk frame with bad_message", sawBadMessage(),
+    JSON.stringify(s.context.window.__raw.slice(-3)));
+  check("post-auth server error keeps the auth overlay hidden",
+    s.elements.authOverlay.hidden === true, s.elements.authOverlay.hidden);
+  check("post-auth server error leaves the dashboard untouched",
+    s.elements.userBar.hidden === false && s.elements.authError.hidden === true,
+    "userBar.hidden=" + s.elements.userBar.hidden + " authError.hidden=" + s.elements.authError.hidden);
+  const hrBeforeErr = s.elements.valHr.innerHTML;
+  await sleep(1300);
+  check("live stream keeps updating after a post-auth server error",
+    s.elements.valHr.innerHTML !== hrBeforeErr,
+    hrBeforeErr + " | " + s.elements.valHr.innerHTML);
+
   global.__TOKEN__ = tokenFinal;
   global.__USER__ = username;
 })()
   .then(() => scenario2(global.__TOKEN__, global.__USER__))
+  .then((ctx) => scenario3(ctx.token, ctx.username))
   .catch((e) => {
     console.error("HARNESS ERROR: " + (e && e.stack ? e.stack : e));
     summary(1);
@@ -297,6 +359,71 @@ async function scenario2(token, username) {
   await waitFor(() => !/^--/.test(s.elements.valHr.innerHTML), 6000, "stream after token auth");
   check("token session receives broadcasts", !/^--/.test(s.elements.valHr.innerHTML),
     s.elements.valHr.innerHTML);
+
+  // --- badge-write guard: identical badge state must not be rewritten --
+  // The feeder emits the same normal beat (is_anomaly=false, confidence
+  // 98.5) over and over; after the first flush no className write may
+  // happen. The HR check underneath proves beats kept flowing meanwhile.
+  await waitFor(() => /NORMAL BEAT/.test(s.elements.diagTitle.innerText), 6000,
+    "first flushed NORMAL beat badge");
+  const badgeWritesBefore = s.elements.diagBadge.classNameWrites();
+  const guardHr = s.elements.valHr.innerHTML;
+  await sleep(2100);
+  const badgeWritesAfter = s.elements.diagBadge.classNameWrites();
+  check("badge className not rewritten while badge state is unchanged",
+    badgeWritesBefore > 0 && badgeWritesAfter === badgeWritesBefore,
+    badgeWritesBefore + " -> " + badgeWritesAfter);
+  check("beats kept flowing during the badge-guard window",
+    s.elements.valHr.innerHTML !== guardHr &&
+      /NORMAL BEAT/.test(s.elements.diagTitle.innerText),
+    guardHr + " | " + s.elements.valHr.innerHTML +
+      " | badge=" + s.elements.diagTitle.innerText);
+
+  return { token, username };
+}
+
+/* ================================================================== */
+/* Scenario 3: unexpected drop of a live session -> CONNECTION LOST    */
+/*             badge -> jittered backoff -> broadcasts resume          */
+/* ================================================================== */
+async function scenario3(token, username) {
+  const s = boot({ liveguard_token: token, liveguard_user: username });
+  s.elements.wsUrl.value = WS_URL;
+
+  s.context.toggleConnect();
+  await waitFor(() => s.elements.authOverlay.hidden === true, 8000, "scenario3: auth_ok");
+  await waitFor(() => !/^--/.test(s.elements.valHr.innerHTML), 6000, "scenario3: live stream");
+
+  // Unexpected close of the healthy authenticated socket (no closingReason:
+  // exactly what handleClose sees when the server or network drops us).
+  vm.runInContext("ws.close()", s.context);
+  await waitFor(() => /CONNECTION LOST/.test(s.elements.diagTitle.innerText), 4000,
+    "scenario3: connection-lost badge");
+  check("unexpected drop shows the connection-lost attempt badge",
+    /attempt 1\/5/.test(s.elements.diagSub.innerText), s.elements.diagSub.innerText);
+
+  // The socket is fully closed now, so the HR badge is frozen: whatever it
+  // shows can only change again once broadcasts resume after the backoff.
+  const hrAtDrop = s.elements.valHr.innerHTML;
+  const tDrop = Date.now();
+
+  // First backoff: 2s +/-20% jitter (1.6s..2.4s) + token re-auth.
+  await waitFor(() => !/CONNECTION LOST/.test(s.elements.diagTitle.innerText), 7000,
+    "scenario3: badge clears after the first backoff");
+  const elapsed = Date.now() - tDrop;
+  check("first backoff waited ~2s (jittered) before reconnecting",
+    elapsed >= 1400 && elapsed <= 5000, elapsed + "ms");
+
+  await waitFor(() => s.elements.valHr.innerHTML !== hrAtDrop, 6000,
+    "scenario3: broadcasts resume after backoff");
+  check("broadcasts resume after the first backoff",
+    s.elements.valHr.innerHTML !== hrAtDrop,
+    hrAtDrop + " | " + s.elements.valHr.innerHTML);
+  check("connection-lost badge cleared after reconnect",
+    !/CONNECTION LOST/.test(s.elements.diagTitle.innerText),
+    s.elements.diagTitle.innerText);
+  check("auth overlay stayed hidden through the auto-reconnect",
+    s.elements.authOverlay.hidden === true, s.elements.authOverlay.hidden);
   summary(0);
 }
 

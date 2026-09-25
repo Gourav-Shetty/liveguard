@@ -56,7 +56,6 @@ def _load_calibrated_threshold(fallback=0.35) -> float:
         return fallback
 
 
-DEFAULT_ANOMALY_THRESHOLD = 0.35  # fallback
 DEFAULT_ANOMALY_THRESHOLD = _load_calibrated_threshold()
 
 TELEMETRY_HOST = "0.0.0.0"

@@ -142,6 +142,12 @@ def main():
     last_pipeline_error_log = None
     max_consecutive_errors = 50
 
+    # Leads-off warning throttle: at most one line per 5s while the leads
+    # stay off, plus one recovery line when contact comes back (so the log
+    # shows both transitions without flooding stderr at 360 lines/second).
+    leads_off_active = False
+    last_leads_off_log = None
+
     try:
         while True:
             try:
@@ -155,18 +161,32 @@ def main():
                 leads_off = sample_data["leads_off"]
 
                 if leads_off:
-                    logger.warning("Leads-off detected!")
+                    # Throttle to one warning per 5s of continuous leads-off
+                    # (same cadence as the pipeline-error log below), and log
+                    # a single line when the leads come back.
+                    now_leads = time.monotonic()
+                    if not leads_off_active or now_leads - last_leads_off_log >= 5.0:
+                        leads_off_active = True
+                        last_leads_off_log = now_leads
+                        logger.warning("Leads-off detected!")
                     consecutive_errors = 0
                     continue
 
+                if leads_off_active:
+                    leads_off_active = False
+                    last_leads_off_log = None
+                    # warning level (not info) so the recovery line is visible
+                    # under the default root-logger level configured above.
+                    logger.warning("Leads reconnected.")
+
                 filtered_ecg = filter_engine.process_sample(raw_ecg)
                 is_r_peak = qrs_detector.process_sample(filtered_ecg)
-                current_hr = qrs_detector.get_heart_rate()
 
                 beat_tensor = segmenter.add_sample(filtered_ecg, is_r_peak)
                 prediction_info = None
 
                 if beat_tensor is not None:
+                    current_hr = qrs_detector.get_heart_rate()
                     total_beats += 1
                     prediction_info = infer_engine.predict_beat(beat_tensor)
 
@@ -196,6 +216,7 @@ def main():
                         })
 
                 if ws_server and sample_count % config.STREAM_BATCH_SIZE == 0:
+                    current_hr = qrs_detector.get_heart_rate()
                     payload = {
                         "type": "telemetry",
                         "raw_ecg": raw_ecg,

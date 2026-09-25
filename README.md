@@ -23,7 +23,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
 * **Modular Multi-Source Hardware Drivers**:
   * **Physical Hardware**: AD8232 ECG sensor via ADS1115 (I2C 16-bit ADC), MCP3008 (SPI 10-bit ADC), or Arduino Serial bridge.
   * **Clinical Replay**: Built-in streaming driver to replay real patient recordings from the MIT-BIH Arrhythmia Database at precise sampling rates (360 Hz).
-* **Live HTML5 Telemetry & Oscilloscope**: A standalone, zero-dependency browser oscilloscope ([`frontend/test_viewer.html`](frontend/test_viewer.html)) connecting via asynchronous WebSockets (`ws://0.0.0.0:8765`) to stream raw ECG waveforms, filtered signals, instant R-peak badges, BPM metrics, and real-time arrhythmia alarms.
+* **Live HTML5 Telemetry & Oscilloscope**: A standalone, zero-dependency browser oscilloscope ([`frontend/test_viewer.html`](frontend/test_viewer.html)) connecting via asynchronous WebSockets to stream raw ECG waveforms, filtered signals, instant R-peak badges, BPM metrics, and real-time arrhythmia alarms. The telemetry server **binds** `0.0.0.0:8765` (all network interfaces) — that is not a connect address; open the viewer at `ws://<host>:8765` (the viewer's own default URL is `ws://raspberrypi.local:8765`).
 * **Privacy-Preserving Federated Learning**: 38-client non-IID patient simulation engine using Flower (`flwr`), evaluating localized training rounds, weight aggregation (FedAvg/FedProx), and cross-patient generalization.
 * **Two-Stage Arrhythmia Classification**:
   * **Stage 1 (Binary Anomaly Gate)**: Rapid anomaly filtering (Normal vs. Arrhythmia) with calibrated 96%+ abnormal beat recall.
@@ -84,7 +84,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
  │                      FEDERATED LEARNING (Flower FedAvg)                       │
  │   • Local Head Fine-Tuning: On-device gradient updates on local beats         │
  │   • Central Aggregator: Multi-client FedAvg weight averaging (Flower FL)      │
- │   • Zero Raw Data Transmission: Only encrypted/raw weight updates (Δw)        │
+ │   • Zero Raw Data Transmission: Weight updates only — no raw ECG (Δw)         │
  └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -290,11 +290,11 @@ proximal-mu = 0.0 # set > 0 for FedProx
 
 Two regression suites cover the backend pipeline and the browser dashboard (GitHub Actions runs both on every push and pull request):
 
-* **Python suite — 57 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI, hardening: TLS fail-closed, slow-client drop, fan-out isolation, registration caps):
+* **Python suite — 77 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI, hardening: TLS fail-closed, slow-client drop, fan-out isolation, registration caps, session bad-message budget, config/secret recovery):
   ```bash
   python -m unittest discover -s tests -t .
   ```
-* **Node frontend harness — 26 checks** (headless viewer auth + broadcast checks; runs the real inline script of [`frontend/test_viewer.html`](frontend/test_viewer.html) outside the browser; requires Node.js ≥ 21 — CI uses Node 22):
+* **Node frontend harness — 39 checks** (headless viewer auth + broadcast + reconnect checks; runs the real inline script of [`frontend/test_viewer.html`](frontend/test_viewer.html) outside the browser; requires Node.js ≥ 21 — CI uses Node 22):
   ```bash
   # terminal 1 — synthetic telemetry feed (point it at a FRESH data dir:
   # registration only opens while the user store is empty)
@@ -369,7 +369,7 @@ LiveGuard/
 ├── .github/workflows/ci.yml           # GitHub Actions CI: compile gate + unittest + frontend harness
 │
 ├── tests/                             # Regression suites (Python unittest + Node frontend harness)
-│   ├── test_pipeline.py               # End-to-end pipeline & telemetry server tests
+│   ├── test_pipeline.py               # run_edge subprocess regression (telemetry server tests: test_auth_flow.py / test_hardening.py)
 │   ├── test_auth_flow.py              # Auth, handshake, rate-limit & admin CLI tests
 │   ├── frontend_harness.js            # Headless viewer auth/broadcast tests
 │   └── harness_feeder.py              # Synthetic telemetry feed for the harness

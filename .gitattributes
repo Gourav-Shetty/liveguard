@@ -1,0 +1,40 @@
+# Normalize line endings so the Windows dev box and Linux CI never fight
+# over CRLF/LF: text is stored and checked out as LF everywhere.
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# Binary files — never normalize line endings, never diff as text.
+# Every tracked binary (verified with a NUL-byte scan of `git ls-files`).
+# ---------------------------------------------------------------------------
+data/mitbih_test_ready.npz -text
+data/mitbih_train_ready.npz -text
+data/mitbih_val_ready.npz -text
+data/stage1_cnn_centralized.pth -text
+data/stage1_weights.npz -text
+docs/LiveGuard_Hardware_Guide.docx -text
+docs/LiveGuard_Laptop_Arduino_Quickstart.docx -text
+training/quickstart-pytorch/centralized_classwise_metrics.png -text
+training/quickstart-pytorch/centralized_loss_curve.png -text
+training/quickstart-pytorch/centralized_test_confusion_matrix.png -text
+training/quickstart-pytorch/centralized_validation_confusion_matrix.png -text
+training/quickstart-pytorch/centralized_validation_test_performance.png -text
+
+# Same rule by extension, so binaries added later are covered automatically.
+*.npz -text
+*.pth -text
+*.docx -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.ico -text
+*.pdf -text
+*.zip -text
+*.pt -text
+*.onnx -text
+*.npy -text
+*.woff -text
+*.woff2 -text
+*.ttf -text
+
+# CSV/log/json/txt and other data files stay plain text (LF via `* text=auto`).

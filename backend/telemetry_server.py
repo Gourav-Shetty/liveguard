@@ -42,6 +42,17 @@ MAX_REGISTER_SUCCESSES_PER_CONNECTION = 1
 # it is not meant to block legitimate shared-NAT deployments.
 MAX_IP_REGISTER_SUCCESSES = 25
 IP_REGISTER_WINDOW_SECONDS = 600.0
+# Full-map expiry sweeps of the per-IP budgets run at most this often, so a
+# burst of reserves costs O(1) instead of O(tracked keys) while holding the
+# lock. The entry for the IP actually being reserved is ALWAYS expiry-filtered
+# (see _reserve_ip_*), so per-IP window semantics stay exact between sweeps.
+IP_SWEEP_INTERVAL_SECONDS = 5.0
+# Consecutive malformed/unknown messages an authenticated client may send in
+# the session phase before it is disconnected with 1008. The counter lives in
+# the per-connection state and is reset whenever a recognized message (logout)
+# arrives, so a briefly glitching client is not cut off but a frame-spammer
+# can no longer earn error replies forever.
+MAX_SESSION_BAD_MESSAGES = 10
 # Every send (broadcast or direct reply) is best-effort and bounded: a client
 # that cannot absorb a message within this window is treated as slow and
 # disconnected instead of being buffered to forever.
@@ -86,9 +97,19 @@ class TelemetryServer:
         # TelemetryServer gets a fresh budget.
         self._ip_reg_successes: dict[str, list[float]] = {}
         self._ip_reg_successes_lock = threading.Lock()
+        # Monotonic timestamps of the last full-map expiry sweep per budget;
+        # guarded by the matching lock above (see IP_SWEEP_INTERVAL_SECONDS).
+        self._last_failure_sweep = 0.0
+        self._last_registration_sweep = 0.0
         # Opt-in TLS context, built in start() from LIVEGUARD_TLS_CERT/KEY.
         # None means the plain ws:// behaviour of earlier versions.
         self._ssl_context: ssl.SSLContext | None = None
+        # Shutdown coordination for stop(): the future _serve awaits while
+        # serving (created on the event loop, completed via
+        # loop.call_soon_threadsafe), plus the flag covering stop() racing
+        # start() before the loop even exists.
+        self._serve_future: asyncio.Future | None = None
+        self._stop_requested = threading.Event()
         self.loop = None
         self.thread = None
 
@@ -113,19 +134,13 @@ class TelemetryServer:
     async def _send(self, websocket, payload: dict) -> None:
         """Send one direct reply, never blocking the event loop for long.
 
+        Serializes the payload here, then defers the actual write to
+        :meth:`_deliver`, which owns the single copy of the per-send timeout,
+        slow-client drop and exception containment shared with broadcasts.
         Best-effort: on timeout the peer is dropped (it stopped reading), on
         disconnect the reply is simply lost.
         """
-        try:
-            await asyncio.wait_for(
-                websocket.send(json.dumps(payload)), timeout=CLIENT_SEND_TIMEOUT
-            )
-        # asyncio.TimeoutError is only an alias of the builtin TimeoutError
-        # from Python 3.11; on 3.10 it is a distinct class, so catch both.
-        except (TimeoutError, asyncio.TimeoutError):
-            await self._drop_slow_client(websocket, "reply")
-        except ConnectionClosed:
-            pass  # client went away before reading the reply
+        await self._deliver(websocket, json.dumps(payload), context="reply")
 
     @staticmethod
     async def _close(websocket, reason: str, code: int = POLICY_VIOLATION_CLOSE_CODE) -> None:
@@ -151,18 +166,30 @@ class TelemetryServer:
         cannot overrun the cap: the extra connections are refused without
         getting a guess. Successful logins call :meth:`_refund_ip_attempt`.
         Expired entries are swept opportunistically so a long-running server
-        only ever holds one key per active source IP.
+        only ever holds one key per active source IP: the full-map sweep runs
+        at most once per IP_SWEEP_INTERVAL_SECONDS, while the entry for
+        ``ip`` itself is always expiry-filtered, so this IP's window stays
+        exact between sweeps.
         """
         now = time.monotonic()
         with self._ip_failures_lock:
-            expired = [
-                key
-                for key, (_, started) in self._ip_failures.items()
-                if now - started > IP_FAILURE_WINDOW_SECONDS
-            ]
-            for key in expired:
-                del self._ip_failures[key]
-            count, started = self._ip_failures.get(ip, (0, now))
+            if now - self._last_failure_sweep >= IP_SWEEP_INTERVAL_SECONDS:
+                self._last_failure_sweep = now
+                expired = [
+                    key
+                    for key, (_, started) in self._ip_failures.items()
+                    if now - started > IP_FAILURE_WINDOW_SECONDS
+                ]
+                for key in expired:
+                    del self._ip_failures[key]
+            entry = self._ip_failures.get(ip)
+            if entry is not None and now - entry[1] > IP_FAILURE_WINDOW_SECONDS:
+                # The queried key's window is expiry-filtered on EVERY reserve
+                # (not only during the throttled sweep): an expired entry
+                # starts a fresh window exactly as if it had just been swept.
+                del self._ip_failures[ip]
+                entry = None
+            count, started = entry if entry is not None else (0, now)
             if count >= MAX_IP_AUTH_FAILURES:
                 return False
             self._ip_failures[ip] = (count + 1, started)
@@ -188,21 +215,37 @@ class TelemetryServer:
 
         Reserved before the account is created, refunded when creation fails,
         so the rolling window only ever counts successes and a parallel burst
-        cannot overshoot the cap. Expired stamps are swept opportunistically.
+        cannot overshoot the cap. Expired stamps are swept opportunistically:
+        the full-map sweep runs at most once per IP_SWEEP_INTERVAL_SECONDS,
+        while the stamps for ``ip`` itself are always expiry-filtered, so this
+        IP's window stays exact between sweeps.
         """
         now = time.monotonic()
         with self._ip_reg_successes_lock:
-            for key in list(self._ip_reg_successes):
-                active = [
-                    stamp
-                    for stamp in self._ip_reg_successes[key]
-                    if now - stamp <= IP_REGISTER_WINDOW_SECONDS
-                ]
-                if active:
-                    self._ip_reg_successes[key] = active
-                else:
-                    del self._ip_reg_successes[key]
-            stamps = self._ip_reg_successes.get(ip, [])
+            if now - self._last_registration_sweep >= IP_SWEEP_INTERVAL_SECONDS:
+                self._last_registration_sweep = now
+                for key in list(self._ip_reg_successes):
+                    active = [
+                        stamp
+                        for stamp in self._ip_reg_successes[key]
+                        if now - stamp <= IP_REGISTER_WINDOW_SECONDS
+                    ]
+                    if active:
+                        self._ip_reg_successes[key] = active
+                    else:
+                        del self._ip_reg_successes[key]
+            # Always expiry-filter the queried key (even when the throttled
+            # sweep above didn't run), so a window that has just elapsed is
+            # honoured exactly on the very next reserve for that IP.
+            stamps = [
+                stamp
+                for stamp in self._ip_reg_successes.get(ip, [])
+                if now - stamp <= IP_REGISTER_WINDOW_SECONDS
+            ]
+            if stamps:
+                self._ip_reg_successes[ip] = stamps
+            else:
+                self._ip_reg_successes.pop(ip, None)
             if len(stamps) >= MAX_IP_REGISTER_SUCCESSES:
                 return False
             stamps.append(now)
@@ -348,9 +391,17 @@ class TelemetryServer:
                 password = data.get("password")
                 # PBKDF2 runs off the event loop (asyncio.to_thread) so a
                 # register/login storm cannot stall live telemetry delivery.
-                ok, reason = await asyncio.to_thread(
-                    self.auth.register, username, password
-                )
+                try:
+                    ok, reason = await asyncio.to_thread(
+                        self.auth.register, username, password
+                    )
+                except Exception:
+                    # The IP registration slot was reserved above; refund it
+                    # or a failing store (locked database, disk full, ...)
+                    # would leak one slot per crash for the whole window.
+                    # Re-raise: _handler's catch-all kills the connection.
+                    self._refund_ip_registration(client_ip)
+                    raise
                 if ok:
                     conn_state["register_successes"] = (
                         conn_state.get("register_successes", 0) + 1
@@ -408,9 +459,17 @@ class TelemetryServer:
                     token = None
                     if isinstance(username, str) and isinstance(password, str):
                         # PBKDF2 off the event loop -- see register branch.
-                        token = await asyncio.to_thread(
-                            self.auth.authenticate, username, password
-                        )
+                        try:
+                            token = await asyncio.to_thread(
+                                self.auth.authenticate, username, password
+                            )
+                        except Exception:
+                            # The failed-attempt slot was reserved before the
+                            # password check; refund it so a broken store
+                            # cannot silently leak rate-limit budget. Re-raise:
+                            # _handler's catch-all kills the connection.
+                            self._refund_ip_attempt(client_ip)
+                            raise
                     if token is not None:
                         result = (username.strip().lower(), token)
 
@@ -447,11 +506,43 @@ class TelemetryServer:
                 {"type": "error", "code": "bad_message", "reason": "unexpected message type"},
             )
 
-    async def _session_phase(self, websocket) -> str:
+    async def _note_bad_session_message(self, websocket, conn_state: dict) -> bool:
+        """Count one more consecutive bad message in the session phase.
+
+        Returns True once the per-connection budget is exhausted, after
+        closing the connection with 1008. The counter lives in the
+        per-connection state, so it survives logout/re-auth cycles on the
+        same socket, and it is reset whenever a recognized message (logout)
+        arrives -- without that reset, an honest client that occasionally
+        misbehaves would eventually be locked out.
+        """
+        bad = conn_state.get("bad_messages", 0) + 1
+        conn_state["bad_messages"] = bad
+        if bad < MAX_SESSION_BAD_MESSAGES:
+            return False
+        logger.warning(
+            "closing %s after %d consecutive bad session messages",
+            self._client_ip(websocket),
+            bad,
+        )
+        await self._close(websocket, "too many bad messages")
+        return True
+
+    async def _session_phase(
+        self, websocket, conn_state: dict | None = None
+    ) -> str:
         """Serve an authenticated client until logout or disconnect.
 
         Returns ``"logged_out"`` (client may re-authenticate) or ``"closed"``.
+
+        Malformed and unknown frames are answered with one error each, but
+        only up to MAX_SESSION_BAD_MESSAGES *consecutive* ones: a client that
+        spams junk can no longer earn freshly serialized error replies
+        forever. The counter is kept in ``conn_state`` (per connection) and
+        reset by every recognized message.
         """
+        if conn_state is None:
+            conn_state = {}
         while True:
             try:
                 message = await websocket.recv()
@@ -460,6 +551,8 @@ class TelemetryServer:
 
             data, reason = self._parse_message(message)
             if data is None:
+                if await self._note_bad_session_message(websocket, conn_state):
+                    return "closed"
                 await self._send(
                     websocket,
                     {"type": "error", "code": "bad_message", "reason": reason},
@@ -469,11 +562,15 @@ class TelemetryServer:
             if data["type"] == "logout":
                 # Stop broadcasts before confirming; a client that has read
                 # "logged_out" is guaranteed to be out of connected_clients.
+                # logout is recognized -> reset the bad-message budget.
+                conn_state["bad_messages"] = 0
                 with self._clients_lock:
                     self.connected_clients.discard(websocket)
                 await self._send(websocket, {"type": "logged_out"})
                 return "logged_out"
 
+            if await self._note_bad_session_message(websocket, conn_state):
+                return "closed"
             await self._send(
                 websocket,
                 {"type": "error", "code": "bad_message", "reason": "unexpected message type"},
@@ -498,7 +595,7 @@ class TelemetryServer:
                     websocket,
                     {"type": "auth_ok", "token": token, "username": username},
                 )
-                outcome = await self._session_phase(websocket)
+                outcome = await self._session_phase(websocket, conn_state)
                 if outcome != "logged_out":
                     return
                 # logged out -> back to the authentication phase
@@ -537,19 +634,46 @@ class TelemetryServer:
 
     async def _serve(self):
         self.loop = asyncio.get_running_loop()
-        async with websockets.serve(
-            self._handler, self.host, self.port, ssl=self._ssl_context
-        ):
-            if self._ssl_context is not None:
-                # Status banner, TLS mode only: plain ws:// output stays
-                # byte-identical to earlier versions.
-                print(
-                    f"[Status] telemetry server listening on wss://{self.host}:{self.port}",
-                    flush=True,
-                )
-            await asyncio.Future()
+        # Created here (on this loop) so stop() can complete it thread-safely
+        # from any other thread; cleared again on the way out.
+        self._serve_future = self.loop.create_future()
+        if self._stop_requested.is_set() and not self._serve_future.done():
+            # stop() won the race with start(): never begin serving.
+            self._serve_future.set_result(None)
+        try:
+            async with websockets.serve(
+                self._handler, self.host, self.port, ssl=self._ssl_context,
+                # --- pinned websockets defaults -------------------------------
+                # Verified against the installed websockets 17.1 (the
+                # dependency is `websockets>=12.0`, unbounded) and every one
+                # of these kwargs exists with the same meaning at that floor.
+                # Passing them explicitly means a future release that changes a
+                # default surfaces here as a reviewed diff instead of silent
+                # runtime drift. Version-dependent defaults (server_header)
+                # and non-behavioural ones (logger) are deliberately not
+                # pinned.
+                ping_interval=20,       # keepalive ping every 20s (None = off)
+                ping_timeout=20,        # drop the peer if no pong within 20s
+                close_timeout=10,       # wait up to 10s for closing handshake
+                open_timeout=10,        # HTTP upgrade handshake timeout (s)
+                max_size=1048576,       # 1 MiB max incoming frame
+                max_queue=16,           # frames buffered per connection
+                write_limit=32768,      # 32 KiB per-connection write buffer
+                compression="deflate",  # permessage-deflate negotiated
+            ):
+                if self._ssl_context is not None:
+                    # Status banner, TLS mode only: plain ws:// output stays
+                    # byte-identical to earlier versions.
+                    print(
+                        f"[Status] telemetry server listening on wss://{self.host}:{self.port}",
+                        flush=True,
+                    )
+                await self._serve_future
+        finally:
+            self._serve_future = None
 
     def start(self):
+        self._stop_requested.clear()  # a fresh start() supersedes any stop()
         try:
             self._ssl_context = self._build_ssl_context()
         except Exception as exc:
@@ -566,27 +690,65 @@ class TelemetryServer:
         self.thread = threading.Thread(target=run_loop, daemon=True)
         self.thread.start()
 
+    def stop(self, timeout: float = 3.0) -> None:
+        """Stop a server started by :meth:`start()` and join its thread.
+
+        Thread-safe (call it from any thread), idempotent, and safe to call
+        when the server was never started. Completing the serving future
+        exits ``_serve``'s ``async with`` block, which closes the listener,
+        closes every open connection (close code 1001) and waits for the
+        connection handlers -- so the thread only ends once everything is
+        cleaned up. Returns when the thread has ended or ``timeout`` seconds
+        have elapsed; a still-shutting-down thread is left to finish (it is
+        a daemon thread, so it can never block process exit).
+        """
+        self._stop_requested.set()  # covers stop() racing a slow start()
+        future = self._serve_future
+        loop = self.loop
+        if future is not None and not future.done() and loop is not None:
+            try:
+                # Futures may only be completed from their own event loop;
+                # hand the wake-up to the loop itself.
+                loop.call_soon_threadsafe(self._finish_serving, future)
+            except RuntimeError:
+                pass  # loop already closed; the thread is on its way down
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    @staticmethod
+    def _finish_serving(future: asyncio.Future) -> None:
+        """Complete ``future``; always runs on the owning event-loop thread."""
+        if not future.done():
+            future.set_result(None)
+
     # ------------------------------------------------------------------
     # Broadcasting
     # ------------------------------------------------------------------
-    async def _deliver(self, websocket, message: str) -> None:
+    async def _deliver(
+        self, websocket, message: str, context: str = "broadcast"
+    ) -> None:
         """Send one already-serialized message to one client.
 
-        Bounded by CLIENT_SEND_TIMEOUT and exception-safe: broadcast results
-        are best-effort per client, so a dead or slow peer only ever affects
-        itself.
+        The single delivery path shared by direct replies (:meth:`_send`,
+        ``context="reply"``) and broadcast fan-out (:meth:`_fanout`).
+        Bounded by CLIENT_SEND_TIMEOUT and exception-safe: delivery is
+        best-effort per client, so a dead, slow or misbehaving peer only
+        ever affects itself.
         """
         try:
             await asyncio.wait_for(
                 websocket.send(message), timeout=CLIENT_SEND_TIMEOUT
             )
+        # asyncio.TimeoutError is only an alias of the builtin TimeoutError
+        # from Python 3.11; on 3.10 it is a distinct class, so catch both.
         except (TimeoutError, asyncio.TimeoutError):
-            await self._drop_slow_client(websocket, "broadcast")
+            await self._drop_slow_client(websocket, context)
         except ConnectionClosed:
             pass  # client went away; the handler cleans it up
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("broadcast delivery failed (%s): %r",
-                           self._client_ip(websocket), exc)
+            logger.warning("%s delivery failed (%s): %r",
+                           context, self._client_ip(websocket), exc)
 
     async def _fanout(self, message: str, targets: list) -> None:
         """Hand the single serialized message to every target concurrently.
