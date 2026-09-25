@@ -11,9 +11,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LiveGuard Edge Pipeline")
     parser.add_argument(
         "--source",
-        choices=["ARDUINO", "MOCK", "RPI_SPI", "ADS1115"],
+        choices=["ARDUINO", "MOCK", "RPI_SPI", "ADS1115", "CLINICAL"],
         default=config.DATA_SOURCE,
         help="Input data stream source (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--patient",
+        type=str,
+        default="100",
+        help="Patient ID for CLINICAL mode (e.g., 100 [Normal], 119 [Ventricular], 207 [Flutter])"
     )
     parser.add_argument(
         "--port",
@@ -35,10 +41,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_driver(source: str, port: str = None):
+def get_driver(args):
+    source = args.source
     if source == "MOCK":
         from edge_system.drivers.mock_driver import MockSensorDriver
         return MockSensorDriver()
+
+    elif source == "CLINICAL":
+        from edge_system.drivers.clinical_driver import ClinicalPatientDriver
+        return ClinicalPatientDriver(patient_id=args.patient)
 
     elif source == "ARDUINO":
         try:
@@ -46,7 +57,7 @@ def get_driver(source: str, port: str = None):
         except ImportError:
             print("[ERROR] pyserial is required for ARDUINO mode. Run: sudo apt install -y python3-serial")
             sys.exit(1)
-        driver = ArduinoSerialDriver(port=port)
+        driver = ArduinoSerialDriver(port=args.port)
         driver.connect()
         return driver
 
@@ -89,9 +100,11 @@ def main():
     print("=" * 65)
     print(" LiveGuard-EHMS Edge Intelligence Pipeline")
     print(f" Source: {args.source} | Rate: {config.SAMPLING_RATE_ECG} Hz | Window: {config.BEAT_WINDOW_SIZE}")
+    if args.source == "CLINICAL":
+        print(f" Replaying Hospital Patient: #{args.patient}")
     print("=" * 65)
 
-    driver = get_driver(args.source, args.port)
+    driver = get_driver(args)
     filter_engine = RealTimeFilter(fs=config.SAMPLING_RATE_ECG)
     qrs_detector = PanTompkinsQRSDetector(fs=config.SAMPLING_RATE_ECG)
     segmenter = BeatSegmenter(
@@ -107,6 +120,7 @@ def main():
     total_beats = 0
     anomalies_detected = 0
     start_time = time.time()
+    print("\n[Status] Pipeline active. Monitoring heartbeats in real-time...\n")
 
     try:
         while True:
@@ -141,8 +155,22 @@ def main():
 
                 print(
                     f"Beat #{total_beats:04d} | HR: {current_hr:.1f} BPM | {status_str} "
-                    f"| Total Alerts: {anomalies_detected}"
+                    f"| Total Alerts: {anomalies_detected}",
+                    flush=True
                 )
+
+                if ws_server:
+                    ws_server.broadcast({
+                        "type": "beat",
+                        "prediction": prediction_info["prediction"],
+                        "is_anomaly": prediction_info["is_anomaly"],
+                        "confidence": prediction_info["confidence"],
+                        "abnormal_prob": prediction_info["abnormal_prob"],
+                        "heart_rate": round(current_hr, 1),
+                        "total_alerts": anomalies_detected,
+                        "total_beats": total_beats,
+                        "timestamp": time.time()
+                    })
 
             if ws_server and sample_count % config.STREAM_BATCH_SIZE == 0:
                 payload = {
@@ -151,8 +179,8 @@ def main():
                     "filtered_ecg": round(filtered_ecg, 2),
                     "is_r_peak": is_r_peak,
                     "heart_rate": round(current_hr, 1),
-                    "prediction": prediction_info["prediction"] if prediction_info else None,
-                    "is_anomaly": prediction_info["is_anomaly"] if prediction_info else False,
+                    "total_alerts": anomalies_detected,
+                    "total_beats": total_beats,
                     "timestamp": time.time()
                 }
                 ws_server.broadcast(payload)

@@ -1,1 +1,20 @@
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Raw dataset archives (downloaded from PhysioNet / Kaggle)
+archive/
+*.csv.gz
+
+# IDE and OS artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

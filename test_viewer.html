@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LiveGuard-EHMS: Real-Time ECG Monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0b0f19;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 20px;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 15px;
+      padding-bottom: 15px;
+      border-bottom: 1px solid #1e293b;
+    }
+    h1 {
+      font-size: 22px;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .connection-bar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      background: #1e293b;
+      padding: 8px 12px;
+      border-radius: 6px;
+    }
+    input {
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #f8fafc;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 13px;
+      width: 240px;
+    }
+    button {
+      background: #0284c7;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #0369a1; }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+      display: inline-block;
+    }
+    .status-dot.connected { background: #22c55e; }
+
+    .vitals-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 2fr;
+      gap: 15px;
+      margin-bottom: 15px;
+    }
+    .card {
+      background: #131d31;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 15px;
+      text-align: center;
+    }
+    .card-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #94a3b8;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .card-val {
+      font-size: 32px;
+      font-weight: 700;
+      color: #f8fafc;
+      font-family: monospace;
+    }
+    .unit { font-size: 14px; color: #64748b; font-weight: normal; }
+
+    .diagnosis-badge {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      border-radius: 8px;
+      padding: 10px;
+      font-weight: 700;
+      font-size: 18px;
+      letter-spacing: 0.5px;
+      transition: all 0.2s ease;
+      background: #1e293b;
+      color: #94a3b8;
+    }
+    .diagnosis-badge.normal {
+      background: rgba(34, 197, 94, 0.15);
+      border: 1px solid #22c55e;
+      color: #4ade80;
+    }
+    .diagnosis-badge.abnormal {
+      background: rgba(239, 68, 68, 0.2);
+      border: 2px solid #ef4444;
+      color: #f87171;
+      animation: pulse 0.8s infinite alternate;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 5px rgba(239, 68, 68, 0.4); }
+      100% { box-shadow: 0 0 20px rgba(239, 68, 68, 0.9); }
+    }
+
+    .canvas-container {
+      position: relative;
+      background: #050811;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 320px;
+    }
+    .oscilloscope-grid {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-image: 
+        linear-gradient(rgba(30, 41, 59, 0.3) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(30, 41, 59, 0.3) 1px, transparent 1px);
+      background-size: 25px 25px;
+      pointer-events: none;
+    }
+    footer {
+      margin-top: 15px;
+      display: flex;
+      justify-content: space-between;
+      color: #475569;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🩺 LiveGuard-EHMS <span style="font-size:13px; color:#64748b; font-weight:normal;">Real-Time Edge Monitor</span></h1>
+      <div class="connection-bar">
+        <span class="status-dot" id="statusDot"></span>
+        <input type="text" id="wsUrl" value="ws://raspberrypi.local:8765">
+        <button id="btnConnect" onclick="toggleConnect()">Connect</button>
+      </div>
+    </header>
+
+    <div class="vitals-grid">
+      <div class="card">
+        <div class="card-label">Heart Rate</div>
+        <div class="card-val" id="valHr">-- <span class="unit">BPM</span></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Total Alerts</div>
+        <div class="card-val" id="valAlerts" style="color:#ef4444;">0</div>
+      </div>
+      <div class="diagnosis-badge" id="diagBadge">
+        <span id="diagTitle">STANDBY</span>
+        <span id="diagSub" style="font-size:12px; font-weight:normal; margin-top:4px;">Waiting for telemetry stream...</span>
+      </div>
+    </div>
+
+    <div class="canvas-container">
+      <div class="oscilloscope-grid"></div>
+      <canvas id="ecgCanvas"></canvas>
+    </div>
+
+    <footer>
+      <span>Architecture: Pure-NumPy 1D-CNN (Stage 1 Gate)</span>
+      <span>Sampling Rate: 360 Hz</span>
+    </footer>
+  </div>
+
+  <script>
+    let ws = null;
+    let isConnected = false;
+    let totalAlerts = 0;
+
+    const canvas = document.getElementById("ecgCanvas");
+    const ctx = canvas.getContext("2d");
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = 320;
+    }
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    const maxPoints = 500;
+    const dataBuffer = new Array(maxPoints).fill(0);
+
+    function drawWaveform() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      ctx.beginPath();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = "#00ff66";
+      ctx.shadowColor = "#00ff66";
+      ctx.shadowBlur = 8;
+
+      const sliceWidth = canvas.width / (maxPoints - 1);
+      const centerY = canvas.height / 2;
+      const scaleY = canvas.height / 700; // Scaling factor for ECG amplitude
+
+      for (let i = 0; i < maxPoints; i++) {
+        const x = i * sliceWidth;
+        const y = centerY - (dataBuffer[i] * scaleY);
+
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      requestAnimationFrame(drawWaveform);
+    }
+    requestAnimationFrame(drawWaveform);
+
+    function toggleConnect() {
+      if (isConnected) {
+        if (ws) ws.close();
+      } else {
+        const url = document.getElementById("wsUrl").value;
+        connect(url);
+      }
+    }
+
+    function connect(url) {
+      document.getElementById("btnConnect").innerText = "Connecting...";
+      try {
+        ws = new WebSocket(url);
+
+        ws.onopen = () => {
+          isConnected = true;
+          document.getElementById("statusDot").classList.add("connected");
+          document.getElementById("btnConnect").innerText = "Disconnect";
+          document.getElementById("diagTitle").innerText = "MONITORING ACTIVE";
+          document.getElementById("diagSub").innerText = "Signal stream locked at 360 Hz";
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "telemetry") {
+              dataBuffer.shift();
+              dataBuffer.push(data.filtered_ecg);
+
+              if (data.heart_rate) {
+                document.getElementById("valHr").innerHTML = `${data.heart_rate} <span class="unit">BPM</span>`;
+              }
+              if (data.total_alerts !== undefined) {
+                document.getElementById("valAlerts").innerText = data.total_alerts;
+              }
+            } else if (data.type === "beat") {
+              const badge = document.getElementById("diagBadge");
+              if (data.total_alerts !== undefined) {
+                document.getElementById("valAlerts").innerText = data.total_alerts;
+              }
+              if (data.heart_rate) {
+                document.getElementById("valHr").innerHTML = `${data.heart_rate} <span class="unit">BPM</span>`;
+              }
+              if (data.is_anomaly) {
+                badge.className = "diagnosis-badge abnormal";
+                document.getElementById("diagTitle").innerText = "⚠️ ABNORMAL / ARRHYTHMIA";
+                document.getElementById("diagSub").innerText = `Ventricular beat (Prob: ${(data.abnormal_prob * 100).toFixed(1)}%)`;
+              } else {
+                badge.className = "diagnosis-badge normal";
+                document.getElementById("diagTitle").innerText = "✅ NORMAL BEAT";
+                document.getElementById("diagSub").innerText = `Sinus rhythm (Conf: ${data.confidence}%)`;
+              }
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        ws.onclose = () => {
+          isConnected = false;
+          document.getElementById("statusDot").classList.remove("connected");
+          document.getElementById("btnConnect").innerText = "Connect";
+          document.getElementById("diagBadge").className = "diagnosis-badge";
+          document.getElementById("diagTitle").innerText = "DISCONNECTED";
+          document.getElementById("diagSub").innerText = "Check Raspberry Pi connection";
+        };
+
+        ws.onerror = (err) => {
+          console.error("WebSocket Error:", err);
+          ws.close();
+        };
+
+      } catch (err) {
+        alert("Failed to connect: " + err);
+        document.getElementById("btnConnect").innerText = "Connect";
+      }
+    }
+  </script>
+</body>
+</html>

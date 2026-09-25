@@ -48,9 +48,16 @@ class NumPyInferenceEngine:
     def predict_beat(self, beat_tensor):
         x = np.array(beat_tensor, dtype=np.float32)
         if x.ndim == 2:
-            x = x
+            if x.shape[0] > x.shape[1]:
+                x = x.T
         elif x.ndim == 1:
             x = x.reshape(1, -1)
+        elif x.ndim == 3:
+            x = x.squeeze()
+            if x.ndim == 1:
+                x = x.reshape(1, -1)
+            elif x.shape[0] > x.shape[1]:
+                x = x.T
 
         x = self._conv1d(x, self.weights["c1_w"], self.weights["c1_b"], padding=3)
         x = np.maximum(0, x)

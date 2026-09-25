@@ -46,9 +46,21 @@ def export_model_to_numpy(pth_path, out_npz_path):
     print(f"Exported fused weights to: {out_npz_path} ({os.path.getsize(out_npz_path)} bytes)")
 
 if __name__ == "__main__":
-    pth = "quickstart-pytorch/stage1_cnn.pth"
-    out = "quickstart-pytorch/stage1_weights.npz"
-    if os.path.exists(pth):
-        export_model_to_numpy(pth, out)
+    candidates = [
+        "data/stage1_cnn_centralized.pth",
+        "quickstart-pytorch/stage1_cnn_centralized.pth",
+        "quickstart-pytorch/stage1_cnn.pth"
+    ]
+    pth_found = None
+    for c in candidates:
+        if os.path.exists(c):
+            pth_found = c
+            break
+
+    if pth_found:
+        out1 = "quickstart-pytorch/stage1_weights.npz"
+        out2 = "data/stage1_weights.npz"
+        export_model_to_numpy(pth_found, out1)
+        export_model_to_numpy(pth_found, out2)
     else:
-        print(f"{pth} not found yet. Run after training finishes.")
+        print("No .pth model found yet. Run train_centralized.py first.")

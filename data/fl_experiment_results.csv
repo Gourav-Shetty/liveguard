@@ -1,0 +1,2 @@
+timestamp,model_file,proximal_mu,seed,num_supernodes,chosen_threshold,val_auc,val_pr_auc,test_auc,test_pr_auc,test_recall_abnormal,test_precision_abnormal
+2026-09-17T07:29:33.857717+00:00,stage1_cnn_centralized.pth,N/A (Centralized),42,Centralized,0.0246,0.8448,0.7703,0.785,0.3743,0.9691,0.1341

@@ -12,13 +12,18 @@ class RealTimeFilter:
         self.b_band, self.a_band = signal.butter(
             config.FILTER_ORDER, [low, high], btype="bandpass"
         )
-        self.zi_band = signal.lfilter_zi(self.b_band, self.a_band) * 0.0
+        self.zi_band = None
 
         w0 = config.NOTCH_FREQ / (0.5 * fs)
         self.b_notch, self.a_notch = signal.iirnotch(w0, config.NOTCH_Q)
-        self.zi_notch = signal.lfilter_zi(self.b_notch, self.a_notch) * 0.0
+        self.zi_notch = None
 
     def process_sample(self, raw_sample: float) -> float:
+        if self.zi_band is None:
+            self.zi_band = signal.lfilter_zi(self.b_band, self.a_band) * raw_sample
+        if self.zi_notch is None:
+            self.zi_notch = signal.lfilter_zi(self.b_notch, self.a_notch) * 0.0
+
         filtered_band, self.zi_band = signal.lfilter(
             self.b_band, self.a_band, [raw_sample], zi=self.zi_band
         )
@@ -31,17 +36,15 @@ class RealTimeFilter:
 class PanTompkinsQRSDetector:
     def __init__(self, fs: int = config.SAMPLING_RATE_ECG):
         self.fs = fs
-        self.refractory_period = config.QRS_REFRACTORY_PERIOD
+        self.refractory_period = int(0.25 * fs)
         self.samples_since_last_peak = self.refractory_period
-
-        self.int_window = config.INTEGRATION_WINDOW
-        self.int_buffer = collections.deque(maxlen=self.int_window)
+        self.int_window = collections.deque(maxlen=int(0.10 * fs))
         self.deriv_buffer = collections.deque(maxlen=5)
-
-        self.signal_level = 0.0
-        self.noise_level = 0.0
-        self.threshold_i1 = 0.0
-        self.threshold_i2 = 0.0
+        self.spk = 200.0
+        self.npk = 20.0
+        self.threshold = 60.0
+        self.prev_int = 0.0
+        self.prev_prev_int = 0.0
         self.recent_rr = collections.deque(maxlen=8)
 
     def process_sample(self, filtered_sample: float) -> bool:
@@ -59,31 +62,30 @@ class PanTompkinsQRSDetector:
         ) / 8.0
 
         squared = d * d
-        self.int_buffer.append(squared)
-        integrated = sum(self.int_buffer) / len(self.int_buffer)
+        self.int_window.append(squared)
+        curr_int = sum(self.int_window) / len(self.int_window)
 
         is_peak = False
-        if self.samples_since_last_peak > self.refractory_period:
-            if integrated > self.threshold_i1:
+        if self.prev_int > self.prev_prev_int and self.prev_int >= curr_int:
+            peak_val = self.prev_int
+            if peak_val > self.threshold and self.samples_since_last_peak > self.refractory_period:
                 is_peak = True
-                self.signal_level = 0.125 * integrated + 0.875 * self.signal_level
+                self.spk = 0.125 * peak_val + 0.875 * self.spk
                 self.recent_rr.append(self.samples_since_last_peak)
                 self.samples_since_last_peak = 0
             else:
-                self.noise_level = 0.125 * integrated + 0.875 * self.noise_level
+                self.npk = 0.125 * peak_val + 0.875 * self.npk
+            self.threshold = self.npk + 0.25 * (self.spk - self.npk)
 
-            self.threshold_i1 = self.noise_level + 0.25 * (
-                self.signal_level - self.noise_level
-            )
-            self.threshold_i2 = 0.5 * self.threshold_i1
-
+        self.prev_prev_int = self.prev_int
+        self.prev_int = curr_int
         return is_peak
 
     def get_heart_rate(self) -> float:
         if len(self.recent_rr) < 2:
             return 72.0
-        avg_rr_samples = np.mean(self.recent_rr)
-        bpm = (self.fs * 60.0) / max(1.0, avg_rr_samples)
+        avg_rr = np.mean(self.recent_rr)
+        bpm = (self.fs * 60.0) / max(1.0, avg_rr)
         return float(np.clip(bpm, 40.0, 220.0))
 
 

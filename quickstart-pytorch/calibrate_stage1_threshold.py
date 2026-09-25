@@ -26,7 +26,21 @@ from sklearn.metrics import (
     precision_recall_curve
 )
 
-DATA_DIR = os.environ.get("LIVEGUARD_DATA_DIR", "/mnt/c/Users/mirza/Downloads/livegaurd")
+def _find_data_dir():
+    if "LIVEGUARD_DATA_DIR" in os.environ and os.path.exists(os.environ["LIVEGUARD_DATA_DIR"]):
+        return os.environ["LIVEGUARD_DATA_DIR"]
+    candidates = [
+        r"C:\LiveGuard\data",
+        os.path.join(os.path.dirname(__file__), "..", "data"),
+        os.path.dirname(__file__),
+        r"/mnt/c/Users/mirza/Downloads/livegaurd"
+    ]
+    for c in candidates:
+        if os.path.exists(os.path.join(c, "mitbih_val_ready.npz")):
+            return c
+    return os.environ.get("LIVEGUARD_DATA_DIR", "/mnt/c/Users/mirza/Downloads/livegaurd")
+
+DATA_DIR = _find_data_dir()
 VAL_FILE = os.path.join(DATA_DIR, "mitbih_val_ready.npz")
 TEST_FILE = os.path.join(DATA_DIR, "mitbih_test_ready.npz")
 RESULTS_CSV = os.path.join(DATA_DIR, "fl_experiment_results.csv")
