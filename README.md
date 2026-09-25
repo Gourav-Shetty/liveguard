@@ -5,6 +5,7 @@
 [![Inference Engine](https://img.shields.io/badge/inference-Pure--NumPy%20(Zero--PyTorch%20on%20Pi)-brightgreen.svg)]()
 [![Federated Learning](https://img.shields.io/badge/federated--learning-Flower%20(FedAvg)-orange.svg)](https://flower.ai/)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
+[![CI](https://github.com/Gourav-Shetty/liveguard/actions/workflows/ci.yml/badge.svg)](https://github.com/Gourav-Shetty/liveguard/actions/workflows/ci.yml)
 
 **LiveGuard-EHMS** (Edge Health Monitoring System) is an edge-native, real-time cardiac arrhythmia detection and privacy-preserving Federated Learning platform. 
 
@@ -187,10 +188,14 @@ The telemetry dashboard is protected by a username/password login (WebSocket han
 
 ### Accounts
 * **First user**: use *Create account* in the dashboard — registration is open only until the first account exists (bootstrap).
-* **Later users**: an admin provisions them via the CLI (works regardless of the registration policy):
+* **Admin CLI** (works regardless of the registration policy; password prompts also read piped stdin, so it's script-friendly):
   ```bash
-  python -m backend.auth.cli create-user <username>   # prompts for the password
+  python -m backend.auth.cli create-user <username>       # prompts for the password (twice)
+  python -m backend.auth.cli list-users                   # username, role, created, last login — never password data
+  python -m backend.auth.cli change-password <username>   # prompts for current + new password (twice)
+  python -m backend.auth.cli delete-user <username>       # refuses to remove the last remaining account
   ```
+  * `change-password` verifies the current password first; a wrong current password, a nonexistent user, or mismatched new passwords all fail with a non-zero exit code. `delete-user` likewise exits non-zero for a nonexistent user and **refuses to delete the last remaining user** so an admin can't lock themselves out.
 * **Policy override** (env var): `LIVEGUARD_ALLOW_REGISTER=1` keeps registration open, `=0` keeps it closed (default: open only while zero users exist).
 
 ### How it works
@@ -199,10 +204,11 @@ The telemetry dashboard is protected by a username/password login (WebSocket han
 * Unauthenticated clients receive **no telemetry at all** until `auth_ok`.
 * Rate limiting: 3 failed sign-ins per connection, 5 failed registrations per connection, and **10 failed sign-ins per client IP per 5 minutes** (the slot is reserved before the password is checked — parallel connection bursts can't exceed the cap — and refunded on success, so only failures count). Accounts are never locked by username: an attacker cannot deny service to a specific user, and the per-IP budget auto-expires after 5 minutes. Password hashing runs off the event loop, so login attempts can't stall live ECG delivery.
   * *Deployment caveat*: the budget is keyed by the TCP client IP. Devices behind the same NAT share one budget, and behind a TLS-terminating proxy every client would share the proxy's IP — in that case raise `MAX_IP_AUTH_FAILURES` in `backend/telemetry_server.py` or terminate TLS directly on the Python process.
+* Registration **success** cap (bulk-account control): at most **1 successful registration per connection** and **25 successful registrations per client IP per 10-minute rolling window** (in-memory, per server instance; only successes count — failures are covered by the rate limits above).
 * Logout is client-side (stateless tokens): a stolen token stays valid until it expires — rotate `data/.liveguard_secret` to revoke all sessions at once.
 
 ### Security assumptions
-* Traffic runs over plain `ws://` — credentials are **cleartext on the network**. This is acceptable only on a trusted local/ lab network; put the server behind TLS (`wss://`) before exposing it beyond a LAN.
+* Traffic defaults to plain `ws://` — credentials are **cleartext on the network**. This is acceptable only on a trusted local/ lab network. To serve `wss://`, set **both** environment variables `LIVEGUARD_TLS_CERT` and `LIVEGUARD_TLS_KEY` to a PEM certificate/key pair before starting the server (Python stdlib `ssl`, no extra dependencies). The server **fails closed**: if TLS is misconfigured (only one variable set, or an unreadable/invalid PEM) it logs the error and refuses to start rather than silently downgrading to cleartext.
 
 ---
 
@@ -282,17 +288,22 @@ proximal-mu = 0.0 # set > 0 for FedProx
 
 ## 🧪 Tests
 
-Two regression suites cover the backend pipeline and the browser dashboard:
+Two regression suites cover the backend pipeline and the browser dashboard (GitHub Actions runs both on every push and pull request):
 
-* **Python suite — 33 tests** (pipeline, telemetry server, authentication, rate limits):
+* **Python suite — 42 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI):
   ```bash
   python -m unittest discover -s tests -t .
   ```
 * **Node frontend harness — 26 checks** (headless viewer auth + broadcast checks; runs the real inline script of [`frontend/test_viewer.html`](frontend/test_viewer.html) outside the browser):
   ```bash
+  # terminal 1 — synthetic telemetry feed (point it at a FRESH data dir:
+  # registration only opens while the user store is empty)
+  LIVEGUARD_DATA_DIR=/tmp/lg_manual python tests/harness_feeder.py 8766
+
+  # terminal 2
   node tests/frontend_harness.js ws://127.0.0.1:8766
   ```
-  A `TelemetryServer` must already be running — copy the start command from the usage comment at the top of [`tests/frontend_harness.js`](tests/frontend_harness.js). The live-broadcast checks only pass while a pipeline is feeding that same server; an idle server passes the auth checks only.
+  On Windows PowerShell use `$env:LIVEGUARD_DATA_DIR="$env:TEMP\lg_manual"`. Without a feed only the auth checks pass — the live-broadcast checks need beats arriving.
 
 ---
 
@@ -355,10 +366,13 @@ LiveGuard/
 │
 ├── archive/                           # Raw MIT-BIH waveform database (gitignored, not committed)
 │
+├── .github/workflows/ci.yml           # GitHub Actions CI: compile gate + unittest + frontend harness
+│
 ├── tests/                             # Regression suites (Python unittest + Node frontend harness)
 │   ├── test_pipeline.py               # End-to-end pipeline & telemetry server tests
-│   ├── test_auth_flow.py              # Auth, handshake & rate-limit tests
-│   └── frontend_harness.js            # Headless viewer auth/broadcast tests
+│   ├── test_auth_flow.py              # Auth, handshake, rate-limit & admin CLI tests
+│   ├── frontend_harness.js            # Headless viewer auth/broadcast tests
+│   └── harness_feeder.py              # Synthetic telemetry feed for the harness
 │
 └── README.md                          # Master documentation
 ```

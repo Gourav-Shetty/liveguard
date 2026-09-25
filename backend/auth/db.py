@@ -88,6 +88,57 @@ class UserStore:
             )
             self._conn.commit()
 
+    def list_users(self) -> list[dict]:
+        """Return [{username, role, created_at, last_login_at}, ...] by username.
+
+        Only non-secret columns are selected: password material never leaves
+        the store through this method.
+        """
+        with self._lock:
+            self._check_open()
+            rows = self._conn.execute(
+                "SELECT username, role, created_at, last_login_at "
+                "FROM users ORDER BY username"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_user(self, username: str) -> str:
+        """Delete an account: 'deleted', 'not_found', or 'last_user'.
+
+        The existence check, the last-user guard and the DELETE all run under
+        this store's lock, so concurrent callers can never race the store down
+        to zero accounts (which would lock every operator out).
+        """
+        with self._lock:
+            self._check_open()
+            if not isinstance(username, str) or not username:
+                return "not_found"
+            row = self._conn.execute(
+                "SELECT 1 FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if self.user_count() <= 1:
+                return "last_user"
+            self._conn.execute("DELETE FROM users WHERE username = ?", (username,))
+            self._conn.commit()
+            return "deleted"
+
+    def update_password(self, username: str, password_hash: str, salt: str) -> bool:
+        """Set a new password hash + salt; False on invalid args or missing user."""
+        with self._lock:
+            self._check_open()
+            if not all(
+                isinstance(v, str) and v for v in (username, password_hash, salt)
+            ):
+                return False
+            cur = self._conn.execute(
+                "UPDATE users SET password_hash = ?, salt = ? WHERE username = ?",
+                (password_hash, salt, username),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
     def close(self) -> None:
         """Close the connection; later method calls raise RuntimeError."""
         with self._lock:

@@ -1,10 +1,18 @@
 import argparse
+import logging
 import sys
 import time
 
 from backend import config
 from backend.signal_processing import RealTimeFilter, PanTompkinsQRSDetector, BeatSegmenter
 from backend.edge_infer import EdgeInferenceEngine
+
+logger = logging.getLogger(__name__)
+# Error/warning diagnostics go to stderr via the logging module; the normal
+# progress output below stays on stdout, byte-identical. Only configure the
+# root logger when nobody else owns it (never clobber host/test handlers).
+if not logging.getLogger().handlers:
+    logging.basicConfig()
 
 
 def parse_args():
@@ -52,14 +60,14 @@ def get_driver(args):
         try:
             return ClinicalPatientDriver(patient_id=args.patient)
         except FileNotFoundError as e:
-            print(f"[ERROR] Could not load clinical data for patient #{args.patient}: {e}")
+            logger.error("Could not load clinical data for patient #%s: %s", args.patient, e)
             sys.exit(1)
 
     elif source == "ARDUINO":
         try:
             from backend.drivers.serial_driver import ArduinoSerialDriver
         except ImportError:
-            print("[ERROR] pyserial is required for ARDUINO mode. Run: sudo apt install -y python3-serial")
+            logger.error("pyserial is required for ARDUINO mode. Run: sudo apt install -y python3-serial")
             sys.exit(1)
         driver = ArduinoSerialDriver(port=args.port)
         driver.connect()
@@ -70,7 +78,7 @@ def get_driver(args):
             from backend.drivers.rpi_mcp3008_driver import RPiMCP3008Driver
             return RPiMCP3008Driver()
         except Exception as e:
-            print(f"[ERROR] Could not initialize RPi MCP3008 driver: {e}")
+            logger.error("Could not initialize RPi MCP3008 driver: %s", e)
             sys.exit(1)
 
     elif source == "ADS1115":
@@ -78,7 +86,7 @@ def get_driver(args):
             from backend.drivers.ads1115_driver import ADS1115Driver
             return ADS1115Driver()
         except Exception as e:
-            print(f"[ERROR] Could not initialize ADS1115 driver: {e}")
+            logger.error("Could not initialize ADS1115 driver: %s", e)
             sys.exit(1)
 
     else:
@@ -119,7 +127,7 @@ def main():
     try:
         infer_engine = EdgeInferenceEngine(threshold=args.threshold)
     except (FileNotFoundError, ValueError) as e:
-        print(f"[ERROR] Could not initialize inference engine: {e}")
+        logger.error("Could not initialize inference engine: %s", e)
         sys.exit(1)
 
     ws_server = get_telemetry_server(args.no_ws)
@@ -147,7 +155,7 @@ def main():
                 leads_off = sample_data["leads_off"]
 
                 if leads_off:
-                    print("\r[WARNING] Leads-off detected!", end="", flush=True)
+                    logger.warning("Leads-off detected!")
                     consecutive_errors = 0
                     continue
 
@@ -206,11 +214,10 @@ def main():
                 now = time.monotonic()
                 if last_pipeline_error_log is None or now - last_pipeline_error_log >= 5.0:
                     last_pipeline_error_log = now
-                    print(f"[WARN] pipeline error (suppressed): {exc!r}", flush=True)
+                    logger.warning("pipeline error (suppressed): %r", exc)
                 if consecutive_errors >= max_consecutive_errors:
-                    print(
-                        f"[FATAL] {consecutive_errors} consecutive pipeline errors; aborting.",
-                        flush=True
+                    logger.error(
+                        "%d consecutive pipeline errors; aborting.", consecutive_errors
                     )
                     sys.exit(1)
 

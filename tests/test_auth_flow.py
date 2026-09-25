@@ -200,6 +200,38 @@ class CliTests(unittest.TestCase):
             sys.stdin = old_stdin
         return rc, buf.getvalue()
 
+    def _run_cli_args(self, argv, stdin_text: str = ""):
+        """Run the CLI with arbitrary argv; returns (exit_code, captured_output)."""
+        from backend.auth import cli
+
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(stdin_text)  # not a tty -> line-input fallback
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rc = cli.main(argv)
+        finally:
+            sys.stdin = old_stdin
+        return rc, buf.getvalue()
+
+    @contextlib.contextmanager
+    def _isolated_data_dir(self):
+        """Point config.DATA_DIR at a throwaway dir for this test.
+
+        The CLI always opens the *default* store (AuthService() with no
+        argument), which resolves config.DATA_DIR at construction time --
+        so patching it gives each test a private, cleanup-able user store
+        without touching the shared default one.
+        """
+        saved = config.DATA_DIR
+        isolated = tempfile.mkdtemp(prefix="lg_cli_", dir=TMP_DATA_DIR)
+        config.DATA_DIR = isolated
+        try:
+            yield isolated
+        finally:
+            config.DATA_DIR = saved
+            shutil.rmtree(isolated, ignore_errors=True)
+
     def test_cli_create_user_from_piped_stdin(self):
         rc, out = self._run_cli("cli_user", "cli-pass-123\ncli-pass-123\n")
         self.assertEqual(rc, 0, out)
@@ -219,6 +251,149 @@ class CliTests(unittest.TestCase):
         rc, out = self._run_cli("cli_user3", "")
         self.assertEqual(rc, 1, out)
         self.assertIn("no password provided", out)
+
+    # ------------------------------------------------------------------
+    # list-users
+    # ------------------------------------------------------------------
+    def test_cli_list_users_empty_store(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(["list-users"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("No users found.", out)
+
+    def test_cli_list_users_shows_created_account(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "list_user"], "list-pass-123\nlist-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            self.assertIsNotNone(
+                AuthService().authenticate("list_user", "list-pass-123"),
+                "setup login failed",
+            )  # stamps last_login_at
+            rc, out = self._run_cli_args(["list-users"])
+            user = AuthService().store.get_user("list_user")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("list_user", out)
+        self.assertIn("viewer", out)  # role column
+        self.assertNotIn("never", out)  # last login was stamped, not missing
+        # password material must NEVER be printed
+        self.assertNotIn(user["password_hash"], out)
+        self.assertNotIn(user["salt"], out)
+        self.assertNotIn("password", out.lower())
+
+    # ------------------------------------------------------------------
+    # change-password
+    # ------------------------------------------------------------------
+    def test_cli_change_password_success(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "chg_user"], "old-pass-123\nold-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(
+                ["change-password", "chg_user"],
+                "old-pass-123\nnew-pass-456\nnew-pass-456\n",
+            )
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Success", out)
+            self.assertIsNone(
+                AuthService().authenticate("chg_user", "old-pass-123"),
+                "old password must no longer work",
+            )
+            self.assertIsNotNone(
+                AuthService().authenticate("chg_user", "new-pass-456"),
+                "login with the new password must work",
+            )
+
+    def test_cli_change_password_wrong_current(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "chg_wrong"], "old-pass-123\nold-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(
+                ["change-password", "chg_wrong"],
+                "not-the-current\nnew-pass-456\nnew-pass-456\n",
+            )
+            self.assertEqual(rc, 1, out)
+            self.assertIn("current password is incorrect", out)
+            # the stored password is untouched
+            self.assertIsNotNone(AuthService().authenticate("chg_wrong", "old-pass-123"))
+            self.assertIsNone(AuthService().authenticate("chg_wrong", "new-pass-456"))
+
+    def test_cli_change_password_mismatched_new(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "chg_mismatch"], "old-pass-123\nold-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(
+                ["change-password", "chg_mismatch"],
+                "old-pass-123\nnew-pass-456\nnew-pass-789\n",
+            )
+            self.assertEqual(rc, 1, out)
+            self.assertIn("do not match", out)
+            self.assertIsNotNone(
+                AuthService().authenticate("chg_mismatch", "old-pass-123")
+            )
+            self.assertIsNone(AuthService().authenticate("chg_mismatch", "new-pass-456"))
+
+    def test_cli_change_password_nonexistent_user(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["change-password", "ghost_user"],
+                "whatever-pass\nnew-pass-456\nnew-pass-456\n",
+            )
+            self.assertEqual(rc, 1, out)
+            self.assertIn("user not found", out)
+            self.assertEqual(AuthService().store.user_count(), 0)
+
+    # ------------------------------------------------------------------
+    # delete-user
+    # ------------------------------------------------------------------
+    def test_cli_delete_user_removes_account(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "del_user"], "del-pass-123\ndel-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(
+                ["create-user", "keep_user"], "keep-pass-123\nkeep-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(["delete-user", "del_user"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Success", out)
+            self.assertIsNone(AuthService().store.get_user("del_user"))
+            self.assertIsNone(AuthService().authenticate("del_user", "del-pass-123"))
+            # the sibling account is untouched
+            self.assertIsNotNone(AuthService().store.get_user("keep_user"))
+            self.assertIsNotNone(AuthService().authenticate("keep_user", "keep-pass-123"))
+
+    def test_cli_delete_last_user_refused(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "solo_user"], "solo-pass-123\nsolo-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(["delete-user", "solo_user"])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("last remaining user", out)
+            self.assertIsNotNone(AuthService().store.get_user("solo_user"))
+            self.assertIsNotNone(AuthService().authenticate("solo_user", "solo-pass-123"))
+
+    def test_cli_delete_nonexistent_user(self):
+        with self._isolated_data_dir():
+            rc, out = self._run_cli_args(
+                ["create-user", "real_user"], "real-pass-123\nreal-pass-123\n"
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = self._run_cli_args(["delete-user", "ghost_user"])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("user not found", out)
+            # the real account is untouched
+            self.assertIsNotNone(AuthService().store.get_user("real_user"))
 
 
 class IPBudgetTests(unittest.TestCase):

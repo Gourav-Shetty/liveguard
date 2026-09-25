@@ -51,6 +51,35 @@ def _b64decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+def _hash_password(password: str, salt_bytes: bytes) -> str:
+    """PBKDF2-HMAC-SHA256 hex digest (100k iterations, per-user 16-byte salt).
+
+    Shared by account creation, password changes and verification so the
+    stored format stays byte-for-byte identical everywhere (and stays
+    backward-compatible with rows written by older builds).
+    """
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt_bytes, PBKDF2_ITERATIONS
+    ).hex()
+
+
+def _password_matches(user: dict, password: str) -> bool:
+    """Constant-time PBKDF2 check of ``password`` against a stored user row.
+
+    Returns False for malformed rows (missing/garbage salt or hash) instead
+    of raising, so a corrupt account fails closed.
+    """
+    try:
+        salt_bytes = bytes.fromhex(user["salt"])
+        stored_hash = user["password_hash"]
+    except (KeyError, TypeError, ValueError):
+        return False
+    candidate = _hash_password(password, salt_bytes)
+    return isinstance(stored_hash, str) and hmac.compare_digest(
+        candidate, stored_hash
+    )
+
+
 def _load_secret() -> bytes:
     """Return the persistent token-signing secret, creating it on first use.
 
@@ -138,9 +167,7 @@ class AuthService:
         """Hash + insert. Caller must have validated and checked duplicates."""
         salt_bytes = secrets.token_bytes(SALT_BYTES)
         salt = salt_bytes.hex()
-        password_hash = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), salt_bytes, PBKDF2_ITERATIONS
-        ).hex()
+        password_hash = _hash_password(password, salt_bytes)
 
         if not self.store.create_user(username, password_hash, salt, role="viewer"):
             # Lost a race with a concurrent register (or the store filled up).
@@ -221,18 +248,7 @@ class AuthService:
             hmac.compare_digest(dummy, _DUMMY_HASH)
             return None
 
-        try:
-            salt_bytes = bytes.fromhex(user["salt"])
-            stored_hash = user["password_hash"]
-        except (KeyError, TypeError, ValueError):
-            return None
-
-        candidate = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), salt_bytes, PBKDF2_ITERATIONS
-        ).hex()
-        if not isinstance(stored_hash, str) or not hmac.compare_digest(
-            candidate, stored_hash
-        ):
+        if not _password_matches(user, password):
             return None
 
         self.store.record_login(username)
@@ -294,3 +310,62 @@ class AuthService:
                 if self._secret_key is None:
                     self._secret_key = _load_secret()
         return self._secret_key
+
+    # ------------------------------------------------------------------
+    # Admin account management (CLI)
+    # ------------------------------------------------------------------
+    def list_users(self) -> list[dict]:
+        """Account summaries for the admin CLI; never includes password material."""
+        return self.store.list_users()
+
+    def verify_password(self, username, password) -> tuple[bool, str]:
+        """Check a stored password WITHOUT issuing a token or stamping a login.
+
+        The admin CLI uses this to verify the CURRENT password before it
+        prompts for a replacement. Unlike :meth:`authenticate` a missing
+        account is reported distinctly: the CLI is operator-facing, so there
+        is no account-existence side channel to equalize. Returns
+        ``(ok, reason)``.
+        """
+        if not isinstance(username, str) or not isinstance(password, str):
+            return (False, "username and password are required")
+        user = self.store.get_user(username.strip().lower())
+        if user is None:
+            return (False, "user not found")
+        if not _password_matches(user, password):
+            return (False, "current password is incorrect")
+        return (True, "password verified")
+
+    def change_password(self, username, password) -> tuple[bool, str]:
+        """Rehash + persist a NEW password for an existing account.
+
+        The caller must have verified the current password first with
+        :meth:`verify_password` (the CLI does this before prompting for the
+        new one). Uses the same PBKDF2 parameters and storage format as
+        account creation, so old and new rows stay interchangeable.
+        Returns ``(ok, message)``.
+        """
+        ok, username, err = self._validate_credentials(username, password)
+        if not ok:
+            return (False, err)
+        salt_bytes = secrets.token_bytes(SALT_BYTES)
+        salt = salt_bytes.hex()
+        password_hash = _hash_password(password, salt_bytes)
+        if not self.store.update_password(username, password_hash, salt):
+            return (False, "user not found")
+        return (True, "password changed")
+
+    def delete_user(self, username) -> tuple[bool, str]:
+        """Delete an account. Returns ``(ok, message)``.
+
+        The store refuses to remove its last remaining account, so the admin
+        CLI can never lock every operator out of the dashboard.
+        """
+        if not isinstance(username, str) or not username.strip():
+            return (False, "username is required")
+        result = self.store.delete_user(username.strip().lower())
+        if result == "deleted":
+            return (True, "account deleted")
+        if result == "last_user":
+            return (False, "refusing to delete the last remaining user")
+        return (False, "user not found")

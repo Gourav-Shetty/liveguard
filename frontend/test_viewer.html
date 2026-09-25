@@ -420,17 +420,99 @@
     const canvas = el("ecgCanvas");
     const ctx = canvas.getContext("2d");
 
-    function resizeCanvas() {
-      canvas.width = canvas.parentElement.clientWidth;
-      canvas.height = 320;
-    }
-    window.addEventListener("resize", resizeCanvas);
-    resizeCanvas();
-
+    /* ==========================================================
+       Batched "draw on data" rendering
+       ----------------------------------------------------------
+       The socket handlers never repaint or write badges directly:
+       telemetry pushes the sample into a ring buffer (O(1)) and
+       STAGES the high-frequency values (HR, alert count, diagnosis
+       badge). A single requestAnimationFrame callback (renderFrame)
+       then, at most once per display frame:
+         - flushes the staged DOM values (only if they changed), and
+         - repaints the canvas ONLY when new samples (or a resize)
+           arrived since the previous frame.
+       Bursts of N messages therefore coalesce into one repaint, an
+       idle connection repaints nothing, and beat/HR-only messages
+       never touch the canvas. A short mirrored timer keeps the
+       flush bounded where rAF does not run (hidden tab, headless
+       harness); whichever fires first clears the other.
+       ========================================================== */
     const maxPoints = 500;
-    const dataBuffer = new Array(maxPoints).fill(0);
+    const dataBuffer = new Array(maxPoints).fill(0);  // ring buffer: oldest sample lives at bufferHead
+    let bufferHead = 0;           // next write slot == oldest sample
 
-    function drawWaveform() {
+    let renderScheduled = false;  // a frame callback is already in flight
+    let renderTimer = null;       // fallback timer mirroring the rAF
+    let waveformDirty = false;    // samples or canvas size changed -> repaint
+
+    let pendingHr = null;         // heart rate staged for the next frame
+    let pendingAlerts = null;     // alert count staged for the next frame
+    let pendingBadge = null;      // {cls,title,sub} staged for the next frame
+    let appliedHr = null;         // last values written to the DOM (skip no-op writes)
+    let appliedAlerts = null;
+
+    function pushSample(sample) {
+      dataBuffer[bufferHead] = sample;
+      bufferHead = (bufferHead + 1) % maxPoints;
+      waveformDirty = true;
+    }
+
+    // Coalesce: however many messages arrive between frames, only one
+    // callback is ever scheduled.
+    function scheduleRender() {
+      if (renderScheduled) return;
+      renderScheduled = true;
+      requestAnimationFrame(renderFrame);
+      if (renderTimer === null) {
+        renderTimer = setTimeout(function () { renderTimer = null; renderFrame(); }, 32);
+      }
+    }
+
+    function renderFrame() {
+      if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+      renderScheduled = false;
+
+      flushStagedDom();                        // badges/HR: only when something is staged
+      if (waveformDirty && !document.hidden) { // canvas: only when new data arrived
+        waveformDirty = false;
+        paintWaveform();
+      }
+    }
+
+    // One DOM write per frame instead of one per message; values that
+    // did not change are not re-written (no layout invalidation).
+    function flushStagedDom() {
+      if (pendingHr !== null) {
+        if (pendingHr !== appliedHr) {
+          el("valHr").innerHTML = `${pendingHr} <span class="unit">BPM</span>`;
+          appliedHr = pendingHr;
+        }
+        pendingHr = null;
+      }
+      if (pendingAlerts !== null) {
+        if (pendingAlerts !== appliedAlerts) {
+          el("valAlerts").innerText = pendingAlerts;
+          appliedAlerts = pendingAlerts;
+        }
+        pendingAlerts = null;
+      }
+      if (pendingBadge !== null) {
+        el("diagBadge").className = pendingBadge.cls;
+        el("diagTitle").innerText = pendingBadge.title;
+        el("diagSub").innerText = pendingBadge.sub;
+        pendingBadge = null;
+      }
+    }
+
+    // Drop staged stream values so nothing can reach the DOM after the
+    // session ends (logout / disconnect / auth failure).
+    function discardStagedStream() {
+      pendingHr = null;
+      pendingAlerts = null;
+      pendingBadge = null;
+    }
+
+    function paintWaveform() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       ctx.beginPath();
@@ -445,7 +527,7 @@
 
       for (let i = 0; i < maxPoints; i++) {
         const x = i * sliceWidth;
-        const y = centerY - (dataBuffer[i] * scaleY);
+        const y = centerY - (dataBuffer[(bufferHead + i) % maxPoints] * scaleY);
 
         if (i === 0) {
           ctx.moveTo(x, y);
@@ -455,10 +537,21 @@
       }
       ctx.stroke();
       ctx.shadowBlur = 0;
-
-      requestAnimationFrame(drawWaveform);
     }
-    requestAnimationFrame(drawWaveform);
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = 320;
+      waveformDirty = true;   // assigning width/height wipes the bitmap
+      scheduleRender();
+    }
+    window.addEventListener("resize", resizeCanvas);
+    // Repaint once when a hidden tab becomes visible again (rAF is
+    // paused there, so the dirty flag is still pending).
+    window.addEventListener("visibilitychange", function () {
+      if (!document.hidden) scheduleRender();
+    });
+    resizeCanvas();
 
     /* ==========================================================
        Small helpers (storage + UI)
@@ -723,38 +816,35 @@
         if (data.type === "telemetry") {
           const sample = Number(data.filtered_ecg);
           if (!Number.isFinite(sample)) return;   // never poison the waveform buffer
-          dataBuffer.shift();
-          dataBuffer.push(sample);
+          pushSample(sample);   // O(1) ring write; marks the canvas dirty
 
-          if (data.heart_rate) {
-            el("valHr").innerHTML = `${data.heart_rate} <span class="unit">BPM</span>`;
-          }
-          if (data.total_alerts !== undefined) {
-            el("valAlerts").innerText = data.total_alerts;
-          }
+          // Stage the high-frequency badges; flushed once per frame.
+          if (data.heart_rate) pendingHr = data.heart_rate;
+          if (data.total_alerts !== undefined) pendingAlerts = data.total_alerts;
+          scheduleRender();
         } else if (data.type === "beat") {
-          const badge = el("diagBadge");
-          if (data.total_alerts !== undefined) {
-            el("valAlerts").innerText = data.total_alerts;
-          }
-          if (data.heart_rate) {
-            el("valHr").innerHTML = `${data.heart_rate} <span class="unit">BPM</span>`;
-          }
+          if (data.total_alerts !== undefined) pendingAlerts = data.total_alerts;
+          if (data.heart_rate) pendingHr = data.heart_rate;
           if (data.is_anomaly) {
             const prob = Number(data.abnormal_prob);
-            badge.className = "diagnosis-badge abnormal";
-            el("diagTitle").innerText = "⚠️ ABNORMAL / ARRHYTHMIA";
-            el("diagSub").innerText = Number.isFinite(prob)
-              ? `Ventricular beat (Prob: ${(prob * 100).toFixed(1)}%)`
-              : "Ventricular beat detected";
+            pendingBadge = {
+              cls: "diagnosis-badge abnormal",
+              title: "⚠️ ABNORMAL / ARRHYTHMIA",
+              sub: Number.isFinite(prob)
+                ? `Ventricular beat (Prob: ${(prob * 100).toFixed(1)}%)`
+                : "Ventricular beat detected",
+            };
           } else {
             const conf = Number(data.confidence);
-            badge.className = "diagnosis-badge normal";
-            el("diagTitle").innerText = "✅ NORMAL BEAT";
-            el("diagSub").innerText = Number.isFinite(conf)
-              ? `Sinus rhythm (Conf: ${conf}%)`
-              : "Sinus rhythm";
+            pendingBadge = {
+              cls: "diagnosis-badge normal",
+              title: "✅ NORMAL BEAT",
+              sub: Number.isFinite(conf)
+                ? `Sinus rhythm (Conf: ${conf}%)`
+                : "Sinus rhythm",
+            };
           }
+          scheduleRender();   // badges only: the canvas is untouched by beats
         }
       } catch (err) {
         // A malformed stream frame must never break the dashboard loop.
@@ -810,6 +900,7 @@
       clearAuthWatchdog();
       authInFlight = false;
       authed = false;
+      discardStagedStream();       // never write staged badges after the session ends
       lastAuthError = reason;
       pendingAction = null;
       pendingCreds = null;
@@ -853,6 +944,7 @@
       // Server-initiated logout: never auto-reconnect afterwards.
       if (closingReason === null) closingReason = "logout";
       authed = false;
+      discardStagedStream();       // never write staged badges after the session ends
       authInFlight = false;
       pendingAction = null;
       pendingCreds = null;
@@ -881,6 +973,7 @@
       hadOpen = false;
       isConnected = false;
       authed = false;               // stop processing stream messages
+      discardStagedStream();        // drop staged badges so no late flush can fire
       authInFlight = false;
       setPending(false);            // never leave the submit button disabled/spinning
       clearAuthWatchdog();
@@ -970,6 +1063,7 @@
         try { ws.send(JSON.stringify({ type: "logout" })); } catch (e) {}
       }
       authed = false;
+      discardStagedStream();       // never write staged badges after logout
       authInFlight = false;
       pendingAction = null;
       pendingCreds = null;
