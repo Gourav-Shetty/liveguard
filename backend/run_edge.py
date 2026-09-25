@@ -131,6 +131,15 @@ def main():
         sys.exit(1)
 
     ws_server = get_telemetry_server(args.no_ws)
+    if ws_server is not None and not ws_server.wait_ready(5.0):
+        # The server's own bind/startup error was already logged by the
+        # serving thread above this line; make the CONSEQUENCE visible on
+        # stdout too, in the same [NOTICE] style as the import-failure
+        # notice. Do not exit: the pipeline keeps running exactly as before.
+        print(
+            "[NOTICE] Telemetry server failed to start; no telemetry will be delivered.",
+            flush=True,
+        )
 
     sample_count = 0
     total_beats = 0

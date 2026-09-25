@@ -1,6 +1,7 @@
 """Hardening regression tests (stdlib unittest): fail-closed TLS, slow-client
 isolation, broadcast fan-out, registration caps, session-message budgets,
-map-sweep throttling, server stop(), and connection/bind cleanup.
+map-sweep throttling, server stop(), connection/bind cleanup, startup
+readiness (wait_ready) and refund-on-raise for every reserved slot.
 
 Sections:
   A. TLS fail-closed   - LIVEGUARD_TLS_CERT/KEY misconfiguration must never
@@ -10,7 +11,10 @@ Sections:
                          end-to-end broadcast over a real server
   D. Registration caps - per-connection and per-IP success budgets
   E. Session budget    - bad-message cap (1008), stop(), sweep throttling,
-                         auth-timeout cleanup, bind failure survivability
+                         auth-timeout cleanup, bind failure survivability,
+                         wait_ready() startup-readiness signal
+  F. Refund-on-raise   - a raising store/verify_token gives back the slot
+                         it reserved (password, token and register paths)
 
 LIVEGUARD_DATA_DIR is pointed at a throwaway temp directory BEFORE
 backend.config is imported (only when no earlier test module already set it),
@@ -783,7 +787,11 @@ class ConnectionCleanupTests(_ServerFixture):
 
 
 class BindFailureTests(_ServerFixture):
-    """A taken port must fail cleanly and stop() stay safe (8d)."""
+    """A taken port must fail cleanly and stop() stay safe (8d).
+
+    Also asserts the startup-readiness signal stays dark on that failure,
+    which is what run_edge uses to notice that no telemetry can flow.
+    """
 
     def test_start_on_taken_port_fails_and_stop_is_safe(self):
         blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -821,6 +829,73 @@ class BindFailureTests(_ServerFixture):
         finally:
             blocker.close()
 
+    def test_wait_ready_false_after_bind_failure(self):
+        # A bind failure is only ever logged inside the serving thread; the
+        # readiness signal must therefore stay dark so a caller (run_edge)
+        # can tell that NO telemetry will be delivered.
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            blocker.bind(("127.0.0.1", 0))  # bound but NOT listening
+            port = blocker.getsockname()[1]
+
+            server = TelemetryServer(host="127.0.0.1", port=port, auth=self.auth)
+            with self.assertLogs("backend.telemetry_server", level="ERROR"):
+                server.start()
+                deadline = time.monotonic() + 3.0
+                while server.thread.is_alive() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            self.assertFalse(server.thread.is_alive(),
+                             "serving thread survived a bind failure")
+            # Never set by the failed bind: wait_ready() must report False
+            # once its timeout elapses (it waits the full window, it does
+            # not pretend to be ready)...
+            started = time.monotonic()
+            self.assertFalse(server.wait_ready(0.3))
+            self.assertGreaterEqual(
+                time.monotonic() - started, 0.25,
+                "wait_ready() returned before its timeout without being ready",
+            )
+            # ...and stop() keeps readiness cleared.
+            server.stop()
+            self.assertFalse(server.wait_ready(0.3))
+        finally:
+            blocker.close()
+
+
+class StartupReadinessTests(_ServerFixture):
+    """wait_ready(): True only while the server is actually serving (8e).
+
+    Covers the signal run_edge relies on to notice a silent startup
+    failure, plus the start()/stop() hygiene that keeps it truthful
+    across a stop.
+    """
+
+    def test_wait_ready_true_after_start_then_cleared_by_stop(self):
+        # Never started -> not ready (and it must stay False, not flicker).
+        self.assertFalse(self.server.wait_ready(0.2))
+
+        self.server.start()
+        started = time.monotonic()
+        self.assertTrue(
+            self.server.wait_ready(5.0),
+            "wait_ready() never reported a successfully bound server",
+        )
+        self.assertLess(
+            time.monotonic() - started, 3.0,
+            "wait_ready() should fire as soon as the listener is bound",
+        )
+        # The signal is honest: a client can actually connect right now.
+        with connect(self.url, open_timeout=5):
+            pass
+
+        self.server.stop()
+        self.assertFalse(
+            self.server.wait_ready(0.2),
+            "stop() must clear readiness",
+        )
+
 
 # ======================================================================
 # F. Refund-on-raise: a broken store must not leak rate-limit budget
@@ -829,7 +904,8 @@ class RefundOnRaiseTests(_ServerFixture):
     """Reserve-before-attempt slots come back when the store RAISES.
 
     The register/authenticate calls run in asyncio.to_thread and can raise
-    (sqlite3.OperationalError, disk full, ...). Without the refund the
+    (sqlite3.OperationalError, disk full, ...), and verify_token runs inline
+    in _auth_phase and can raise just the same. Without the refund the
     per-IP caps would silently shrink for the rest of the window on every
     such incident; these tests force the exception and assert the slot
     returns while the connection still dies via the handler catch-all.
@@ -893,6 +969,32 @@ class RefundOnRaiseTests(_ServerFixture):
         self.assertIsNone(
             self.server._ip_failures.get("127.0.0.1"),
             "raised authenticate leaked its IP attempt reservation",
+        )
+
+    def test_verify_token_raise_refunds_attempt_slot(self):
+        # Same class of bug as the password branch: the token branch reserves
+        # the per-IP slot BEFORE verify_token runs, so a raising verify_token
+        # must give it back instead of silently shrinking the budget.
+        self.server.start()
+        wait_until_ready(self.url)
+        # Fresh budget: no failed attempts recorded for this IP yet.
+        self.assertIsNone(self.server._ip_failures.get("127.0.0.1"))
+
+        with mock.patch.object(self.auth, "verify_token",
+                               side_effect=RuntimeError("boom")):
+            with connect(self.url, open_timeout=5) as conn:
+                # Token auth frame: {"type": "auth", "token": "..."} -- a
+                # string token is what reaches verify_token in _auth_phase.
+                send_json(conn, {"type": "auth", "token": "bogus-token"})
+                # The re-raised exception dies in _handler's catch-all, so
+                # the connection is closed rather than answered.
+                recv_close(conn, timeout=5.0)
+
+        # The reserved attempt slot was refunded all the way back to empty:
+        # _refund_ip_attempt pops the key when the count reaches zero.
+        self.assertIsNone(
+            self.server._ip_failures.get("127.0.0.1"),
+            "raised verify_token leaked its IP attempt reservation",
         )
 
 

@@ -290,7 +290,7 @@ proximal-mu = 0.0 # set > 0 for FedProx
 
 Two regression suites cover the backend pipeline and the browser dashboard (GitHub Actions runs both on every push and pull request):
 
-* **Python suite — 77 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI, hardening: TLS fail-closed, slow-client drop, fan-out isolation, registration caps, session bad-message budget, config/secret recovery):
+* **Python suite — 80 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI, hardening: TLS fail-closed, slow-client drop, fan-out isolation, registration caps, session bad-message budget, config/secret recovery, startup readiness):
   ```bash
   python -m unittest discover -s tests -t .
   ```

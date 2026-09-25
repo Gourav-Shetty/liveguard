@@ -110,6 +110,13 @@ class TelemetryServer:
         # start() before the loop even exists.
         self._serve_future: asyncio.Future | None = None
         self._stop_requested = threading.Event()
+        # Startup readiness: set by _serve only AFTER websockets.serve has
+        # successfully bound and entered (never when the bind fails), cleared
+        # by start() before relaunching and by stop() once the server has
+        # stopped. wait_ready() parks calling threads on this event, so a
+        # caller can tell a serving server from one whose bind failure is
+        # only visible in the log.
+        self._ready = threading.Event()
         self.loop = None
         self.thread = None
 
@@ -446,9 +453,18 @@ class TelemetryServer:
                     return None
                 if "token" in data:
                     token = data.get("token")
-                    username = (
-                        self.auth.verify_token(token) if isinstance(token, str) else None
-                    )
+                    try:
+                        username = (
+                            self.auth.verify_token(token)
+                            if isinstance(token, str) else None
+                        )
+                    except Exception:
+                        # The failed-attempt slot was reserved before the
+                        # token check; refund it so a broken store
+                        # cannot silently leak rate-limit budget. Re-raise:
+                        # _handler's catch-all kills the connection.
+                        self._refund_ip_attempt(client_ip)
+                        raise
                     if username is not None:
                         result = (username, token)
                     else:
@@ -668,12 +684,18 @@ class TelemetryServer:
                         f"[Status] telemetry server listening on wss://{self.host}:{self.port}",
                         flush=True,
                     )
+                # The listener is bound and accepting: only NOW is the server
+                # actually serving, so only now may wait_ready() be told so.
+                # A bind failure escapes before this line, so _ready stays
+                # clear and wait_ready() reports False.
+                self._ready.set()
                 await self._serve_future
         finally:
             self._serve_future = None
 
     def start(self):
         self._stop_requested.clear()  # a fresh start() supersedes any stop()
+        self._ready.clear()  # restart hygiene: ready only once THIS start binds
         try:
             self._ssl_context = self._build_ssl_context()
         except Exception as exc:
@@ -690,6 +712,20 @@ class TelemetryServer:
         self.thread = threading.Thread(target=run_loop, daemon=True)
         self.thread.start()
 
+    def wait_ready(self, timeout: float | None = None) -> bool:
+        """Block until this server is actually serving, or ``timeout`` elapses.
+
+        Thread-safe (call it from any thread): parks the caller on the
+        internal readiness event that :meth:`_serve` sets only *after*
+        ``websockets.serve`` has successfully bound and entered, so it
+        returns True exactly when a client can connect. Returns False on
+        timeout, before ``start()``, when the bind failed (the error is
+        already logged by the serving thread), and after ``stop()``.
+        ``timeout=None`` waits forever -- only sensible when something else
+        guarantees the server will come up.
+        """
+        return self._ready.wait(timeout)
+
     def stop(self, timeout: float = 3.0) -> None:
         """Stop a server started by :meth:`start()` and join its thread.
 
@@ -700,7 +736,8 @@ class TelemetryServer:
         connection handlers -- so the thread only ends once everything is
         cleaned up. Returns when the thread has ended or ``timeout`` seconds
         have elapsed; a still-shutting-down thread is left to finish (it is
-        a daemon thread, so it can never block process exit).
+        a daemon thread, so it can never block process exit). Clears the
+        readiness event, so :meth:`wait_ready` reports False after stop().
         """
         self._stop_requested.set()  # covers stop() racing a slow start()
         future = self._serve_future
@@ -715,6 +752,11 @@ class TelemetryServer:
         thread = self.thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
+        # The server has stopped (or never got far enough to serve): readiness
+        # must not outlive stop(), so a later wait_ready() reports False and a
+        # subsequent start() begins from a known-clean state (start() clears
+        # it too, before relaunching).
+        self._ready.clear()
 
     @staticmethod
     def _finish_serving(future: asyncio.Future) -> None:
