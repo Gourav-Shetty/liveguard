@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LiveGuard-EHMS: Real-Time ECG Monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0b0f19;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 20px;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 15px;
+      padding-bottom: 15px;
+      border-bottom: 1px solid #1e293b;
+    }
+    h1 {
+      font-size: 22px;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .connection-bar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      background: #1e293b;
+      padding: 8px 12px;
+      border-radius: 6px;
+    }
+    input {
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #f8fafc;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 13px;
+      width: 240px;
+    }
+    button {
+      background: #0284c7;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #0369a1; }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+      display: inline-block;
+    }
+    .status-dot.connected { background: #22c55e; }
+
+    .vitals-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 2fr;
+      gap: 15px;
+      margin-bottom: 15px;
+    }
+    .card {
+      background: #131d31;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 15px;
+      text-align: center;
+    }
+    .card-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #94a3b8;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .card-val {
+      font-size: 32px;
+      font-weight: 700;
+      color: #f8fafc;
+      font-family: monospace;
+    }
+    .unit { font-size: 14px; color: #64748b; font-weight: normal; }
+
+    .diagnosis-badge {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      border-radius: 8px;
+      padding: 10px;
+      font-weight: 700;
+      font-size: 18px;
+      letter-spacing: 0.5px;
+      transition: all 0.2s ease;
+      background: #1e293b;
+      color: #94a3b8;
+    }
+    .diagnosis-badge.normal {
+      background: rgba(34, 197, 94, 0.15);
+      border: 1px solid #22c55e;
+      color: #4ade80;
+    }
+    .diagnosis-badge.abnormal {
+      background: rgba(239, 68, 68, 0.2);
+      border: 2px solid #ef4444;
+      color: #f87171;
+      animation: pulse 0.8s infinite alternate;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 5px rgba(239, 68, 68, 0.4); }
+      100% { box-shadow: 0 0 20px rgba(239, 68, 68, 0.9); }
+    }
+
+    .canvas-container {
+      position: relative;
+      background: #050811;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 320px;
+    }
+    .oscilloscope-grid {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-image: 
+        linear-gradient(rgba(30, 41, 59, 0.3) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(30, 41, 59, 0.3) 1px, transparent 1px);
+      background-size: 25px 25px;
+      pointer-events: none;
+    }
+    footer {
+      margin-top: 15px;
+      display: flex;
+      justify-content: space-between;
+      color: #475569;
+      font-size: 12px;
+    }
+
+    /* ---------- header user/session bar ---------- */
+    .header-right {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+      align-items: center;
+    }
+    .user-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      background: #1e293b;
+      padding: 8px 12px;
+      border-radius: 6px;
+    }
+    .user-bar[hidden] { display: none; }
+    .user-name {
+      font-family: monospace;
+      font-size: 13px;
+      color: #38bdf8;
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    button:disabled {
+      background: #334155;
+      color: #64748b;
+      cursor: not-allowed;
+    }
+    button:disabled:hover { background: #334155; }
+
+    /* ---------- auth overlay ---------- */
+    .auth-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(3, 6, 14, 0.82);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .auth-overlay[hidden] { display: none; }
+    .auth-modal {
+      width: 100%;
+      max-width: 380px;
+      background: #131d31;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+    }
+    .auth-brand {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-size: 20px;
+      font-weight: 700;
+      color: #38bdf8;
+    }
+    .auth-tag {
+      margin-top: 6px;
+      text-align: center;
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .auth-tabs {
+      display: flex;
+      gap: 6px;
+      margin: 18px 0 14px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 4px;
+    }
+    .auth-tab {
+      flex: 1;
+      background: transparent;
+      color: #94a3b8;
+      padding: 8px;
+      border-radius: 4px;
+    }
+    .auth-tab:hover { background: #1e293b; color: #e2e8f0; }
+    .auth-tab.active { background: #0284c7; color: #ffffff; }
+    .auth-tab.active:hover { background: #0369a1; color: #ffffff; }
+    .auth-field { margin-bottom: 10px; }
+    .auth-field label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #94a3b8;
+    }
+    .auth-field input { width: 100%; }
+    .auth-error {
+      margin-bottom: 10px;
+      padding: 8px 10px;
+      border: 1px solid #ef4444;
+      border-radius: 4px;
+      background: rgba(239, 68, 68, 0.15);
+      color: #f87171;
+      font-size: 13px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .auth-error[hidden] { display: none; }
+    .auth-submit { width: 100%; padding: 9px; font-size: 14px; }
+    .auth-status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      margin-top: 12px;
+      min-height: 16px;
+      font-size: 12px;
+      color: #64748b;
+      text-align: center;
+    }
+    .auth-retry {
+      display: block;
+      width: 100%;
+      margin-top: 10px;
+      background: transparent;
+      border: 1px solid #334155;
+      color: #94a3b8;
+      padding: 7px;
+    }
+    .auth-retry:hover { background: #1e293b; color: #e2e8f0; }
+    .auth-retry[hidden] { display: none; }
+    .spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid #334155;
+      border-top-color: #38bdf8;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex: 0 0 auto;
+    }
+    .spinner[hidden] { display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🩺 LiveGuard-EHMS <span style="font-size:13px; color:#64748b; font-weight:normal;">Real-Time Edge Monitor</span></h1>
+      <div class="header-right">
+        <div class="user-bar" id="userBar" hidden>
+          <span class="user-name" title="Signed in as">👤 <span id="userName"></span></span>
+          <button id="btnLogout" onclick="logout()">Logout</button>
+        </div>
+        <div class="connection-bar">
+          <span class="status-dot" id="statusDot"></span>
+          <input type="text" id="wsUrl" value="ws://raspberrypi.local:8765">
+          <button id="btnConnect" onclick="toggleConnect()">Connect</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="vitals-grid">
+      <div class="card">
+        <div class="card-label">Heart Rate</div>
+        <div class="card-val" id="valHr">-- <span class="unit">BPM</span></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Total Alerts</div>
+        <div class="card-val" id="valAlerts" style="color:#ef4444;">0</div>
+      </div>
+      <div class="diagnosis-badge" id="diagBadge">
+        <span id="diagTitle">STANDBY</span>
+        <span id="diagSub" style="font-size:12px; font-weight:normal; margin-top:4px;">Waiting for telemetry stream...</span>
+      </div>
+    </div>
+
+    <div class="canvas-container">
+      <div class="oscilloscope-grid"></div>
+      <canvas id="ecgCanvas"></canvas>
+    </div>
+
+    <footer>
+      <span>Architecture: Pure-NumPy 1D-CNN (Stage 1 Gate)</span>
+      <span>Sampling Rate: 360 Hz</span>
+    </footer>
+  </div>
+
+  <div class="auth-overlay" id="authOverlay" hidden>
+    <div class="auth-modal" role="dialog" aria-modal="true" aria-label="LiveGuard-EHMS authentication">
+      <div class="auth-brand">🩺 LiveGuard-EHMS</div>
+      <div class="auth-tag" id="authTag">Sign in to start monitoring</div>
+      <form id="authForm" autocomplete="off">
+        <div class="auth-tabs">
+          <button type="button" class="auth-tab active" id="tabSignin">Sign in</button>
+          <button type="button" class="auth-tab" id="tabRegister">Create account</button>
+        </div>
+        <div class="auth-field">
+          <label for="authUser">Username</label>
+          <input type="text" id="authUser" placeholder="username" autocapitalize="none" spellcheck="false">
+        </div>
+        <div class="auth-field">
+          <label for="authPass">Password</label>
+          <input type="password" id="authPass" placeholder="••••••••">
+        </div>
+        <div class="auth-error" id="authError" hidden></div>
+        <button type="submit" class="auth-submit" id="authSubmit">Sign in</button>
+      </form>
+      <div class="auth-status">
+        <span class="spinner" id="authSpinner" hidden></span>
+        <span class="status-dot" id="authDot"></span>
+        <span id="authStatus">Not connected</span>
+      </div>
+      <button type="button" class="auth-retry" id="btnRetry">Retry connection</button>
+    </div>
+  </div>
+
+  <script>
+    /* ==========================================================
+       LiveGuard-EHMS viewer: live ECG telemetry + authentication
+       Wire protocol (JSON over the same telemetry WebSocket)
+         client -> {type:"register", username, password}
+         client -> {type:"auth", username, password}
+         client -> {type:"auth", token}
+         client -> {type:"logout"}
+         server -> {type:"register_ok", username}
+         server -> {type:"auth_ok", token, username}
+         server -> {type:"auth_error", reason}
+         server -> {type:"error", code, reason}
+         server -> {type:"logged_out"}
+         server -> {type:"telemetry", ...} / {type:"beat", ...} (only after auth_ok)
+       ========================================================== */
+
+    let ws = null;
+    let isConnected = false;   // the socket is currently open
+    let authed = false;        // auth_ok received -> stream messages are processed
+    let totalAlerts = 0;
+
+    /* ---------- auth / connection state ---------- */
+    let authMode = "login";          // "login" | "register"
+    let pendingAction = null;        // queued request: {type:"register"|"auth_user"|"auth_token", ...}
+    let pendingCreds = null;         // {username,password} kept for the auto-login after register_ok
+    let currentUser = null;
+    let authInFlight = false;
+    let lastAuthError = null;        // last auth_error reason (used for the lockout case)
+    let closingReason = null;        // "manual" | "logout" | null (null = unexpected close)
+    let hadOpen = false;             // did the current socket reach the "open" state?
+    let reconnectingSession = false; // we are retrying a previously authenticated session
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
+    let authWatchdog = null;
+    let currentUrl = "ws://raspberrypi.local:8765";
+
+    const TOKEN_KEY = "liveguard_token";
+    const USER_KEY = "liveguard_user";
+
+    const el = (id) => document.getElementById(id);
+
+    const canvas = el("ecgCanvas");
+    const ctx = canvas.getContext("2d");
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = 320;
+    }
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    const maxPoints = 500;
+    const dataBuffer = new Array(maxPoints).fill(0);
+
+    function drawWaveform() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      ctx.beginPath();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = "#00ff66";
+      ctx.shadowColor = "#00ff66";
+      ctx.shadowBlur = 8;
+
+      const sliceWidth = canvas.width / (maxPoints - 1);
+      const centerY = canvas.height / 2;
+      const scaleY = canvas.height / 700; // Scaling factor for ECG amplitude
+
+      for (let i = 0; i < maxPoints; i++) {
+        const x = i * sliceWidth;
+        const y = centerY - (dataBuffer[i] * scaleY);
+
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      requestAnimationFrame(drawWaveform);
+    }
+    requestAnimationFrame(drawWaveform);
+
+    /* ==========================================================
+       Small helpers (storage + UI)
+       ========================================================== */
+    function storeGet(key) {
+      try { return localStorage.getItem(key); } catch (e) { return null; }
+    }
+    function storeSet(key, value) {
+      try {
+        if (value === null || value === undefined) localStorage.removeItem(key);
+        else localStorage.setItem(key, value);
+      } catch (e) { /* storage unavailable (private mode) */ }
+    }
+
+    function clearAuthWatchdog() {
+      if (authWatchdog) { clearTimeout(authWatchdog); authWatchdog = null; }
+    }
+
+    function showOverlay() {
+      el("authOverlay").hidden = false;
+      if (!el("authUser").value) el("authUser").value = storeGet(USER_KEY) || "";
+      updateRetryButton();
+    }
+    function hideOverlay() { el("authOverlay").hidden = true; }
+
+    function setAuthError(message) {
+      const box = el("authError");
+      if (!message) { box.hidden = true; box.innerText = ""; }
+      else { box.hidden = false; box.innerText = message; }
+    }
+    function setStatus(text) { el("authStatus").innerText = text; }
+
+    function setPending(on, label) {
+      authInFlight = on;
+      el("authSubmit").disabled = on;
+      el("authSpinner").hidden = !on;
+      if (on) {
+        el("authSubmit").innerText = label || "Working...";
+        if (label) setStatus(label);
+      } else {
+        el("authSubmit").innerText = authMode === "register" ? "Create account" : "Sign in";
+      }
+    }
+
+    function updateRetryButton() {
+      const connecting = ws && ws.readyState === WebSocket.CONNECTING;
+      el("btnRetry").hidden = isConnected || connecting;
+    }
+
+    function setAuthMode(mode) {
+      authMode = mode;
+      el("tabSignin").classList.toggle("active", mode === "login");
+      el("tabRegister").classList.toggle("active", mode === "register");
+      el("authTag").innerText = mode === "register"
+        ? "Create an account to start monitoring"
+        : "Sign in to start monitoring";
+      el("authPass").setAttribute("autocomplete", mode === "register" ? "new-password" : "current-password");
+      if (!authInFlight) {
+        el("authSubmit").innerText = mode === "register" ? "Create account" : "Sign in";
+      }
+    }
+
+    function setStreamIdle(title, subtitle) {
+      el("diagBadge").className = "diagnosis-badge";
+      el("diagTitle").innerText = title;
+      el("diagSub").innerText = subtitle;
+    }
+
+    function showUserBar() {
+      el("userName").innerText = currentUser || "";
+      el("userBar").hidden = false;
+    }
+    function hideUserBar() { el("userBar").hidden = true; }
+
+    /* ==========================================================
+       Connect / disconnect
+       ========================================================== */
+    function toggleConnect() {
+      if (isConnected) {
+        closingReason = "manual";
+        try { if (ws) ws.close(); } catch (e) {}
+      } else if (!ws || ws.readyState !== WebSocket.CONNECTING) {
+        connect(el("wsUrl").value, true);
+      }
+    }
+
+    // manual = true  -> user-initiated (Connect / Retry / form submit): show the overlay, reset retry budget
+    // manual = false -> automatic reconnect: keep the overlay hidden, reuse the stored token
+    function connect(url, manual) {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      clearAuthWatchdog();
+      currentUrl = url || currentUrl;
+      closingReason = null;
+      hadOpen = false;
+      lastAuthError = null;
+
+      // detach any previous socket so its close event cannot corrupt the new state
+      if (ws) {
+        ws.onopen = null; ws.onmessage = null; ws.onclose = null; ws.onerror = null;
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+          try { ws.close(); } catch (e) {}
+        }
+      }
+
+      if (manual) {
+        reconnectAttempts = 0;
+        reconnectingSession = false;
+        showOverlay();
+        setAuthError(null);
+        setPending(false);
+        setStatus("Connecting to " + currentUrl + " ...");
+      } else {
+        setStreamIdle("RECONNECTING", "Attempt " + reconnectAttempts + "/3 - retrying ...");
+      }
+      el("btnConnect").innerText = "Connecting...";
+      el("statusDot").classList.remove("connected");
+      el("authDot").classList.remove("connected");
+
+      try {
+        ws = new WebSocket(currentUrl);
+      } catch (err) {
+        onConnectFailure("Cannot connect to " + currentUrl + " - " + (err && err.message ? err.message : "invalid address"));
+        return;
+      }
+      ws.onopen = handleOpen;
+      ws.onmessage = handleMessage;
+      ws.onclose = handleClose;
+      ws.onerror = handleSocketError;
+      updateRetryButton();
+    }
+
+    function onConnectFailure(message) {
+      isConnected = false;
+      hadOpen = false;
+      authInFlight = false;
+      el("statusDot").classList.remove("connected");
+      el("authDot").classList.remove("connected");
+      el("btnConnect").innerText = "Connect";
+      setPending(false);
+      showOverlay();
+      setAuthError(message);
+      setStatus("Not connected");
+      updateRetryButton();
+      setStreamIdle("DISCONNECTED", "Check Raspberry Pi connection");
+    }
+
+    function handleSocketError(event) {
+      // The server is probably not running; onclose fires right after this.
+      console.warn("WebSocket connection error:", event && event.type ? event.type : event);
+      try { if (ws) ws.close(); } catch (e) {}
+    }
+
+    /* ==========================================================
+       Socket open / message / close
+       ========================================================== */
+    function handleOpen() {
+      hadOpen = true;
+      isConnected = true;
+      el("statusDot").classList.add("connected");
+      el("authDot").classList.add("connected");
+      el("btnConnect").innerText = "Disconnect";
+      updateRetryButton();
+
+      // 1) an in-flight request (login / register / queued sign-in)
+      if (pendingAction) { performAction(pendingAction); return; }
+
+      // 2) a stored token -> authenticate immediately
+      const token = storeGet(TOKEN_KEY);
+      if (token) {
+        pendingAction = { type: "auth_token", token: token };
+        performAction(pendingAction);
+        return;
+      }
+
+      // 3) nothing to send -> the user must sign in or register
+      clearAuthWatchdog();
+      setPending(false);
+      showOverlay();
+      setAuthError(null);
+      setStatus("Connected - sign in to continue");
+      setStreamIdle("AWAITING SIGN-IN", "Authenticate to start the live stream");
+    }
+
+    function performAction(action) {
+      if (!action) return;
+      clearAuthWatchdog();
+      setAuthError(null);
+
+      let message;
+      let label;
+      if (action.type === "register") {
+        message = { type: "register", username: action.username, password: action.password };
+        label = "Creating account...";
+      } else if (action.type === "auth_user") {
+        message = { type: "auth", username: action.username, password: action.password };
+        label = "Signing in...";
+      } else {
+        message = { type: "auth", token: action.token };
+        label = "Verifying session...";
+      }
+      setPending(true, label);
+
+      try {
+        ws.send(JSON.stringify(message));
+      } catch (err) {
+        pendingAction = null;
+        setPending(false);
+        setAuthError("Could not reach the server. Please try again.");
+        return;
+      }
+
+      // The server must answer within 10s (it closes the socket otherwise).
+      authWatchdog = setTimeout(function () {
+        authWatchdog = null;
+        if (authed) return;
+        pendingAction = null;
+        setPending(false);
+        setAuthError("Sign-in timed out - the server did not respond. Please try again.");
+        setStatus(isConnected ? "Connected" : "Not connected");
+      }, 10000);
+    }
+
+    function handleMessage(event) {
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch (err) {
+        console.warn("Ignoring non-JSON message");
+        return;
+      }
+      if (!data || typeof data !== "object") return;
+
+      switch (data.type) {
+        case "telemetry":
+        case "beat":
+          // Defensive: never touch the buffer/badges while unauthenticated.
+          if (!authed) return;
+          handleStreamMessage(data);
+          return;
+        case "register_ok":
+          handleRegisterOk(data);
+          return;
+        case "auth_ok":
+          handleAuthOk(data);
+          return;
+        case "auth_error":
+          handleAuthError(data);
+          return;
+        case "error":
+          handleServerError(data);
+          return;
+        case "logged_out":
+          handleLoggedOut();
+          return;
+        default:
+          return;
+      }
+    }
+
+    function handleStreamMessage(data) {
+      try {
+        if (data.type === "telemetry") {
+          const sample = Number(data.filtered_ecg);
+          if (!Number.isFinite(sample)) return;   // never poison the waveform buffer
+          dataBuffer.shift();
+          dataBuffer.push(sample);
+
+          if (data.heart_rate) {
+            el("valHr").innerHTML = `${data.heart_rate} <span class="unit">BPM</span>`;
+          }
+          if (data.total_alerts !== undefined) {
+            el("valAlerts").innerText = data.total_alerts;
+          }
+        } else if (data.type === "beat") {
+          const badge = el("diagBadge");
+          if (data.total_alerts !== undefined) {
+            el("valAlerts").innerText = data.total_alerts;
+          }
+          if (data.heart_rate) {
+            el("valHr").innerHTML = `${data.heart_rate} <span class="unit">BPM</span>`;
+          }
+          if (data.is_anomaly) {
+            const prob = Number(data.abnormal_prob);
+            badge.className = "diagnosis-badge abnormal";
+            el("diagTitle").innerText = "⚠️ ABNORMAL / ARRHYTHMIA";
+            el("diagSub").innerText = Number.isFinite(prob)
+              ? `Ventricular beat (Prob: ${(prob * 100).toFixed(1)}%)`
+              : "Ventricular beat detected";
+          } else {
+            const conf = Number(data.confidence);
+            badge.className = "diagnosis-badge normal";
+            el("diagTitle").innerText = "✅ NORMAL BEAT";
+            el("diagSub").innerText = Number.isFinite(conf)
+              ? `Sinus rhythm (Conf: ${conf}%)`
+              : "Sinus rhythm";
+          }
+        }
+      } catch (err) {
+        // A malformed stream frame must never break the dashboard loop.
+        console.warn("Ignoring bad stream message:", err);
+      }
+    }
+
+    /* ==========================================================
+       Protocol responses
+       ========================================================== */
+    function handleRegisterOk(data) {
+      // Registration succeeded but did NOT log us in -> auth with the same credentials.
+      if (pendingCreds && pendingAction && pendingAction.type === "register") {
+        pendingAction = { type: "auth_user", username: pendingCreds.username, password: pendingCreds.password };
+        setAuthMode("login");
+        performAction(pendingAction);
+        setStatus("Account created - signing you in...");
+        return;
+      }
+      pendingAction = null;
+      setPending(false);
+      showOverlay();
+      setAuthMode("login");
+      if (data && data.username) el("authUser").value = data.username;
+      setAuthError(null);
+      setStatus("Account created - sign in to continue");
+    }
+
+    function handleAuthOk(data) {
+      authed = true;
+      authInFlight = false;
+      reconnectAttempts = 0;
+      reconnectingSession = false;
+      lastAuthError = null;
+      pendingAction = null;
+      pendingCreds = null;
+      clearAuthWatchdog();
+
+      currentUser = (data && data.username) || storeGet(USER_KEY) || "";
+      if (data && data.token) storeSet(TOKEN_KEY, data.token);
+      storeSet(USER_KEY, currentUser);
+
+      setPending(false);
+      setAuthError(null);
+      hideOverlay();
+      showUserBar();
+      updateRetryButton();
+      setStreamIdle("MONITORING ACTIVE", "Signal stream locked at 360 Hz");
+    }
+
+    function handleAuthError(data) {
+      const reason = (data && data.reason) ? String(data.reason) : "Authentication failed.";
+      clearAuthWatchdog();
+      authInFlight = false;
+      authed = false;
+      lastAuthError = reason;
+      pendingAction = null;
+      pendingCreds = null;
+      reconnectingSession = false;
+      storeSet(TOKEN_KEY, null);   // stored token is invalid/expired or the sign-in was rejected
+      currentUser = null;
+      hideUserBar();
+
+      setPending(false);
+      showOverlay();
+      setAuthError(reason);
+      setStatus(isConnected ? "Connected" : "Not connected");
+      el("authPass").value = "";   // clear only the password field
+      el("authPass").focus();
+    }
+
+    function handleServerError(data) {
+      clearAuthWatchdog();
+      authInFlight = false;
+      pendingAction = null;
+      pendingCreds = null;
+
+      let reason = (data && data.reason) ? String(data.reason) : "";
+      if (!reason) {
+        reason = (data && data.code === "register_failed") ? "Registration failed." : "Server error.";
+      }
+      // Lockouts can arrive as {error, code:"register_failed"} too -- record
+      // them so handleClose() shows the LOCKED OUT state instead of a generic
+      // connection-closed message.
+      if (/too many/i.test(reason)) lastAuthError = reason;
+      setPending(false);
+      showOverlay();
+      setAuthError(reason);
+      setStatus(isConnected ? "Connected" : "Not connected");
+      el("authPass").value = "";   // clear only the password field
+      el("authPass").focus();
+    }
+
+    function handleLoggedOut() {
+      clearAuthWatchdog();
+      // Server-initiated logout: never auto-reconnect afterwards.
+      if (closingReason === null) closingReason = "logout";
+      authed = false;
+      authInFlight = false;
+      pendingAction = null;
+      pendingCreds = null;
+      currentUser = null;
+      reconnectingSession = false;
+      reconnectAttempts = 0;
+      storeSet(TOKEN_KEY, null);
+      storeSet(USER_KEY, null);
+      hideUserBar();
+      setPending(false);
+      setAuthMode("login");
+      el("authUser").value = "";
+      el("authPass").value = "";
+      setAuthError(null);
+      showOverlay();
+      setStatus("Signed out");
+      setStreamIdle("SIGNED OUT", "Sign in to resume monitoring");
+      updateRetryButton();
+    }
+
+    function handleClose() {
+      const reason = closingReason;
+      closingReason = null;
+      const wasAuthed = authed;
+      const wasOpen = hadOpen;
+      hadOpen = false;
+      isConnected = false;
+      authed = false;               // stop processing stream messages
+      authInFlight = false;
+      setPending(false);            // never leave the submit button disabled/spinning
+      clearAuthWatchdog();
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      el("statusDot").classList.remove("connected");
+      el("authDot").classList.remove("connected");
+      el("btnConnect").innerText = "Connect";
+      updateRetryButton();
+
+      // --- user pressed Disconnect ---
+      if (reason === "manual") {
+        setPending(false);
+        if (wasAuthed) {
+          setStreamIdle("DISCONNECTED", "Press Connect to resume monitoring");
+        } else {
+          showOverlay();
+          setStatus("Disconnected");
+        }
+        return;
+      }
+
+      // --- logout (ours or the server's) ---
+      if (reason === "logout") {
+        setPending(false);
+        setAuthError(null);
+        showOverlay();
+        setStatus("Signed out");
+        setStreamIdle("SIGNED OUT", "Sign in to resume monitoring");
+        return;
+      }
+
+      // --- server rejected the sign-in too many times: show that reason, no auto-reconnect ---
+      if (lastAuthError && /too many/i.test(lastAuthError)) {
+        setPending(false);
+        showOverlay();
+        setAuthError(lastAuthError);
+        setStatus("Not connected");
+        setStreamIdle("LOCKED OUT", "Too many failed sign-in attempts");
+        return;
+      }
+
+      // --- an authenticated session dropped: auto-reconnect (max 3 attempts) ---
+      const canResumeSession = (wasAuthed || reconnectingSession) && !!storeGet(TOKEN_KEY);
+      if (canResumeSession) {
+        if (reconnectAttempts < 3) {
+          reconnectAttempts += 1;
+          reconnectingSession = true;
+          setStreamIdle("CONNECTION LOST", "Reconnecting (attempt " + reconnectAttempts + "/3) ...");
+          reconnectTimer = setTimeout(function () {
+            reconnectTimer = null;
+            connect(currentUrl, false);
+          }, 2000);
+          return;
+        }
+        reconnectingSession = false;
+        setPending(false);
+        showOverlay();
+        setAuthError("Connection lost");
+        setStatus("Unable to reconnect after 3 attempts - check the server and press Retry connection.");
+        setStreamIdle("CONNECTION LOST", "Check the server connection");
+        return;
+      }
+
+      // --- closed while unauthenticated (server down / sign-in never completed) ---
+      setPending(false);
+      showOverlay();
+      setStatus("Not connected");
+      if (!wasOpen) {
+        setAuthError("Cannot connect to the server at " + currentUrl + ". Make sure the ECG server is running, then press Retry connection.");
+      } else if (pendingAction) {
+        setAuthError("The connection closed before sign-in completed - submit again to reconnect.");
+      } else {
+        setAuthError("Connection closed.");
+      }
+      setStreamIdle("DISCONNECTED", "Check Raspberry Pi connection");
+    }
+
+    /* ==========================================================
+       Logout
+       ========================================================== */
+    function logout() {
+      closingReason = "logout";
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      clearAuthWatchdog();
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "logout" })); } catch (e) {}
+      }
+      authed = false;
+      authInFlight = false;
+      pendingAction = null;
+      pendingCreds = null;
+      currentUser = null;
+      reconnectingSession = false;
+      reconnectAttempts = 0;
+      storeSet(TOKEN_KEY, null);
+      storeSet(USER_KEY, null);
+      hideUserBar();
+
+      setPending(false);
+      setAuthMode("login");
+      el("authUser").value = "";
+      el("authPass").value = "";
+      setAuthError(null);
+      showOverlay();
+      setStatus("Signed out");
+      setStreamIdle("SIGNED OUT", "Sign in to resume monitoring");
+
+      // Consistent choice: logging out closes the socket (the next sign-in reconnects).
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.close(); } catch (e) {}
+      } else {
+        updateRetryButton();
+      }
+    }
+
+    /* ==========================================================
+       Overlay interactions
+       ========================================================== */
+    function startAction() {
+      if (!pendingAction) return;
+      const label = pendingAction.type === "register" ? "Creating account..."
+        : pendingAction.type === "auth_token" ? "Verifying session..."
+        : "Signing in...";
+
+      if (ws && ws.readyState === WebSocket.OPEN) { performAction(pendingAction); return; }
+      if (ws && ws.readyState === WebSocket.CONNECTING) { setPending(true, label); return; }
+      connect(el("wsUrl").value, true);
+      setPending(true, label);   // connect() clears the pending state, so re-apply it afterwards
+    }
+
+    el("authForm").addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (authInFlight) return;
+
+      const username = el("authUser").value.trim();
+      const password = el("authPass").value;
+      if (!username || !password) {
+        setAuthError("Enter both a username and a password.");
+        return;
+      }
+      setAuthError(null);
+
+      if (authMode === "register") {
+        pendingCreds = { username: username, password: password };
+        pendingAction = { type: "register", username: username, password: password };
+      } else {
+        pendingCreds = null;
+        pendingAction = { type: "auth_user", username: username, password: password };
+      }
+      startAction();
+    });
+
+    el("tabSignin").addEventListener("click", function () {
+      if (authMode === "login") return;
+      setAuthMode("login");
+      el("authPass").value = "";
+      setAuthError(null);
+      el("authPass").focus();
+    });
+
+    el("tabRegister").addEventListener("click", function () {
+      if (authMode === "register") return;
+      setAuthMode("register");
+      el("authPass").value = "";
+      setAuthError(null);
+      el("authPass").focus();
+    });
+
+    el("btnRetry").addEventListener("click", function () {
+      setAuthError(null);
+      if (!pendingAction) {
+        const token = storeGet(TOKEN_KEY);
+        if (token) pendingAction = { type: "auth_token", token: token };
+      }
+      if (pendingAction) startAction();
+      else connect(el("wsUrl").value, true);
+    });
+
+    setAuthMode("login");
+  </script>
+</body>
+</html>

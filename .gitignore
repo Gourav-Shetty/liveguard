@@ -18,3 +18,12 @@ archive/
 .idea/
 .DS_Store
 Thumbs.db
+
+# LiveGuard auth runtime artifacts -- NEVER commit user credentials or the
+# token-signing secret (committing the secret allows forging valid tokens).
+data/.liveguard_secret
+data/liveguard_users.db*
+
+# OpenCode harness artifacts (not part of the project)
+.opencode/
+opencode.json

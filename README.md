@@ -22,7 +22,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
 * **Modular Multi-Source Hardware Drivers**:
   * **Physical Hardware**: AD8232 ECG sensor via ADS1115 (I2C 16-bit ADC), MCP3008 (SPI 10-bit ADC), or Arduino Serial bridge.
   * **Clinical Replay**: Built-in streaming driver to replay real patient recordings from the MIT-BIH Arrhythmia Database at precise sampling rates (360 Hz).
-* **Live HTML5 Telemetry & Oscilloscope**: A standalone, zero-dependency browser oscilloscope ([`test_viewer.html`](test_viewer.html)) connecting via asynchronous WebSockets (`ws://0.0.0.0:8765`) to stream raw ECG waveforms, filtered signals, instant R-peak badges, BPM metrics, and real-time arrhythmia alarms.
+* **Live HTML5 Telemetry & Oscilloscope**: A standalone, zero-dependency browser oscilloscope ([`frontend/test_viewer.html`](frontend/test_viewer.html)) connecting via asynchronous WebSockets (`ws://0.0.0.0:8765`) to stream raw ECG waveforms, filtered signals, instant R-peak badges, BPM metrics, and real-time arrhythmia alarms.
 * **Privacy-Preserving Federated Learning**: 38-client non-IID patient simulation engine using Flower (`flwr`), evaluating localized training rounds, weight aggregation (FedAvg/FedProx), and cross-patient generalization.
 * **Two-Stage Arrhythmia Classification**:
   * **Stage 1 (Binary Anomaly Gate)**: Rapid anomaly filtering (Normal vs. Arrhythmia) with calibrated 96%+ abnormal beat recall.
@@ -73,7 +73,7 @@ It deploys high-accuracy deep learning onto resource-constrained edge hardware (
  ┌───────────────────────────────────────────────────────────────────────────────┐
  │                     TELEMETRY & VISUALIZATION SERVER                          │
  │   • Asynchronous WebSocket Server (port 8765)                                 │
- │   • HTML5 Canvas Oscilloscope Dashboard (test_viewer.html)                    │
+ │   • HTML5 Canvas Oscilloscope Dashboard (frontend/test_viewer.html)  │
  │   • Real-Time Synchronized Waveform & Anomaly Badges                          │
  └───────────────────────────────────────┬───────────────────────────────────────┘
                                          │ Local Ring Buffer of Detected Beats
@@ -130,43 +130,69 @@ Test the complete real-time pipeline using recorded hospital patients:
 
 * **Healthy Patient (#100)**:
   ```bash
-  python3 -m edge_system.run_edge --source CLINICAL --patient 100
+  python3 -m backend.run_edge --source CLINICAL --patient 100
   ```
   *(Expected: Clean rhythm, steady 75-80 BPM, 0 false alarms).*
 
 * **Arrhythmia Patient (#207 - Ventricular Bigeminy / PVC)**:
   ```bash
-  python3 -m edge_system.run_edge --source CLINICAL --patient 207
+  python3 -m backend.run_edge --source CLINICAL --patient 207
   ```
   *(Expected: Live alerts flagging premature ventricular contractions with 0.99–1.00 probability).*
 
 ### 3. Run with Physical Sensors
 ```bash
 # Using ADS1115 I2C ADC:
-python3 -m edge_system.run_edge --source ADS1115
+python3 -m backend.run_edge --source ADS1115
 
 # Using MCP3008 SPI ADC:
-python3 -m edge_system.run_edge --source RPI_SPI
+python3 -m backend.run_edge --source RPI_SPI
 
 # Using Arduino USB Bridge:
-python3 -m edge_system.run_edge --source ARDUINO --port /dev/ttyUSB0
+python3 -m backend.run_edge --source ARDUINO --port /dev/ttyUSB0
 ```
 
 ---
 
 ## 💻 Live Web Visualizer (HTML5 Oscilloscope)
 
-LiveGuard includes an in-browser live oscilloscope in [`test_viewer.html`](test_viewer.html).
+LiveGuard includes an in-browser live oscilloscope in [`frontend/test_viewer.html`](frontend/test_viewer.html).
 
 1. Ensure `run_edge.py` is running on the Pi (or laptop).
-2. Open [`test_viewer.html`](test_viewer.html) in any modern browser (Chrome, Edge, Firefox, Safari).
+2. Open [`frontend/test_viewer.html`](frontend/test_viewer.html) in any modern browser (Chrome, Edge, Firefox, Safari).
 3. Set the WebSocket URL:
    * Local: `ws://localhost:8765`
    * Over Local Network / Wi-Fi: `ws://raspberrypi.local:8765` (or replace with the Pi's IP address).
 4. Click **Connect**:
+   * **Sign in** (or **Create account** on your first run) — the live stream only starts after authentication.
    * Observe the live green ECG trace sweeping across the grid.
    * Watch the heart rate indicator update dynamically on every detected R-peak.
    * Inspect real-time status banners: green for **NORMAL BEAT**, flashing red for **ABNORMAL / ARRHYTHMIA**.
+
+---
+
+## 🔐 Authentication
+
+The telemetry dashboard is protected by a username/password login (WebSocket handshake, no extra dependencies — Python stdlib `sqlite3`/`hashlib`/`hmac` only).
+
+### Accounts
+* **First user**: use *Create account* in the dashboard — registration is open only until the first account exists (bootstrap).
+* **Later users**: an admin provisions them via the CLI (works regardless of the registration policy):
+  ```bash
+  python -m backend.auth.cli create-user <username>   # prompts for the password
+  ```
+* **Policy override** (env var): `LIVEGUARD_ALLOW_REGISTER=1` keeps registration open, `=0` keeps it closed (default: open only while zero users exist).
+
+### How it works
+* Passwords are stored as **PBKDF2-HMAC-SHA256** (100k iterations, per-user 16-byte salt) in `data/liveguard_users.db` (SQLite, gitignored) — never in plaintext.
+* Logins return an **HMAC-signed token** (24 h TTL), signed with a server secret persisted in `data/.liveguard_secret` (gitignored — never commit it).
+* Unauthenticated clients receive **no telemetry at all** until `auth_ok`.
+* Rate limiting: 3 failed sign-ins per connection, 5 failed registrations per connection, and **10 failed sign-ins per client IP per 5 minutes** (the slot is reserved before the password is checked — parallel connection bursts can't exceed the cap — and refunded on success, so only failures count). Accounts are never locked by username: an attacker cannot deny service to a specific user, and the per-IP budget auto-expires after 5 minutes. Password hashing runs off the event loop, so login attempts can't stall live ECG delivery.
+  * *Deployment caveat*: the budget is keyed by the TCP client IP. Devices behind the same NAT share one budget, and behind a TLS-terminating proxy every client would share the proxy's IP — in that case raise `MAX_IP_AUTH_FAILURES` in `backend/telemetry_server.py` or terminate TLS directly on the Python process.
+* Logout is client-side (stateless tokens): a stolen token stays valid until it expires — rotate `data/.liveguard_secret` to revoke all sessions at once.
+
+### Security assumptions
+* Traffic runs over plain `ws://` — credentials are **cleartext on the network**. This is acceptable only on a trusted local/ lab network; put the server behind TLS (`wss://`) before exposing it beyond a LAN.
 
 ---
 
@@ -177,27 +203,27 @@ All neural network training, hyperparameter optimization, and threshold calibrat
 ### 1. Build Partitioned Datasets
 Prepares non-IID patient splits from the MIT-BIH database:
 ```bash
-python build_mitbih_splits.py
+python training/build_mitbih_splits.py
 ```
 
 ### 2. Centralized Model Training
 Trains the Stage 1 1D-CNN on patient partitions with focal/weighted loss:
 ```bash
-python quickstart-pytorch/train_centralized.py
+python training/quickstart-pytorch/train_centralized.py
 ```
 
 ### 3. Calibrate Anomaly Threshold
 Computes optimal precision/recall thresholds for edge deployment:
 ```bash
-python quickstart-pytorch/calibrate_stage1_threshold.py
+python training/quickstart-pytorch/calibrate_stage1_threshold.py
 ```
 
 ### 4. Export Fused Weights to Pure-NumPy Format
 Fuses all `BatchNorm1d` layers directly into `Conv1d` weights and outputs an ultra-compact `.npz` file for the Raspberry Pi:
 ```bash
-python export_weights_to_npz.py
+python training/export_weights_to_npz.py
 ```
-*(Produces `quickstart-pytorch/stage1_weights.npz` - 13.8 KB).*
+*(Produces `data/stage1_weights.npz` - 13.8 KB).*
 
 ---
 
@@ -211,12 +237,12 @@ LiveGuard simulates a federated hospital network where 38 distinct patient nodes
 
 ### Running the FL Simulation:
 ```bash
-cd quickstart-pytorch
+cd training/quickstart-pytorch
 pip install -e .
 flwr run . --stream
 ```
 
-To configure hyperparameters (e.g. number of rounds, batch size, proximal $\mu$), edit [`quickstart-pytorch/pyproject.toml`](quickstart-pytorch/pyproject.toml):
+To configure hyperparameters (e.g. number of rounds, batch size, proximal $\mu$), edit [`training/quickstart-pytorch/pyproject.toml`](training/quickstart-pytorch/pyproject.toml):
 ```toml
 [tool.flwr.app.config]
 num-server-rounds = 20
@@ -243,47 +269,65 @@ proximal-mu = 0.0 # set > 0 for FedProx
 
 ```
 LiveGuard/
-├── edge_system/                     # Real-time edge execution pipeline (Pi-ready)
-│   ├── arduino_bridge/              # Arduino firmware for ADC streaming
-│   ├── drivers/                     # Hardware & simulation drivers
-│   │   ├── ads1115_driver.py        # 16-bit I2C ADC driver
-│   │   ├── clinical_driver.py       # Replay driver for MIT-BIH hospital records
-│   │   ├── mock_driver.py           # Synthetic waveform generator for headless tests
-│   │   ├── rpi_mcp3008_driver.py    # 10-bit SPI ADC driver
-│   │   └── serial_driver.py         # USB Serial driver (Arduino / microcontrollers)
-│   ├── config.py                    # Sampling rates, thresholds, and GPIO pin mapping
-│   ├── edge_infer.py                # Pure-NumPy 1D-CNN inference engine (<14 KB)
-│   ├── run_edge.py                  # Main edge orchestrator
-│   ├── signal_processing.py         # Butterworth IIR filter & Pan-Tompkins QRS detector
-│   └── telemetry_server.py          # Asynchronous WebSocket broadcast server
+├── backend/                           # Real-time edge execution pipeline (Pi-ready)
+│   ├── arduino_bridge/                # Arduino firmware for ADC streaming
+│   ├── auth/                          # Username/password auth (stdlib SQLite + WS handshake)
+│   │   ├── cli.py                     # Admin CLI: create/list/delete users, change password
+│   │   ├── db.py                      # SQLite user store (PBKDF2 password hashing)
+│   │   └── service.py                 # Login/token service & registration policy
+│   ├── drivers/                       # Hardware & simulation drivers
+│   │   ├── ads1115_driver.py          # 16-bit I2C ADC driver
+│   │   ├── clinical_driver.py         # Replay driver for MIT-BIH hospital records
+│   │   ├── mock_driver.py             # Synthetic waveform generator for headless tests
+│   │   ├── rpi_mcp3008_driver.py      # 10-bit SPI ADC driver
+│   │   └── serial_driver.py           # USB Serial driver (Arduino / microcontrollers)
+│   ├── config.py                      # Sampling rates, thresholds, and GPIO pin mapping
+│   ├── edge_infer.py                  # Pure-NumPy 1D-CNN inference engine (<14 KB)
+│   ├── requirements.txt               # Edge runtime dependencies
+│   ├── run_edge.py                    # Main edge orchestrator
+│   ├── signal_processing.py           # Butterworth IIR filter & Pan-Tompkins QRS detector
+│   └── telemetry_server.py            # Asynchronous WebSocket broadcast server
 │
-├── quickstart-pytorch/              # Federated Learning & PyTorch training module
-│   ├── pytorchexample/              # Flower client/server apps
-│   │   ├── client_app.py            # Local client training logic
-│   │   ├── server_app.py            # Global FedAvg aggregator & evaluator
-│   │   └── task.py                  # PyTorch 1D-CNN model & non-IID data loaders
-│   ├── calibrate_stage1_threshold.py# Precision-recall threshold optimization
-│   ├── plot_centralized_results.py  # Generates publication-ready ROC & PR curves
-│   ├── pyproject.toml               # Flower application configuration
-│   ├── stage1_weights.npz           # Exported NumPy weights for edge deployment
-│   └── train_centralized.py         # Baseline centralized model training
+├── frontend/                          # Browser dashboard (zero-dependency HTML5)
+│   └── test_viewer.html               # Real-time HTML5 oscilloscope & alert visualizer
 │
-├── data/                            # Partitioned datasets, weights, and evaluation metrics
-│   ├── fl_experiment_results.csv    # Centralized vs FL benchmark logs
-│   ├── mitbih_test_ready.npz        # Held-out patient test set
-│   ├── mitbih_train_ready.npz       # 38-patient non-IID training split
-│   ├── mitbih_val_ready.npz         # Validation patient split
-│   ├── stage1_cnn_centralized.pth   # Centralized PyTorch checkpoint
-│   └── stage1_weights.npz           # Fused NumPy weights
+├── training/                          # Model training, calibration & weight export (workstation)
+│   ├── quickstart-pytorch/            # Flower FL app & PyTorch training scripts
+│   │   ├── pytorchexample/            # Flower client/server apps
+│   │   │   ├── client_app.py          # Local client training logic
+│   │   │   ├── server_app.py          # Global FedAvg aggregator & evaluator
+│   │   │   └── task.py                # PyTorch 1D-CNN model & non-IID data loaders
+│   │   ├── calibrate_stage1_threshold.py # Precision-recall threshold optimization
+│   │   ├── plot_centralized_results.py   # Generates publication-ready ROC & PR curves
+│   │   ├── pyproject.toml             # Flower application configuration
+│   │   └── train_centralized.py       # Baseline centralized model training
+│   ├── build_mitbih_splits.py         # Preprocesses raw MIT-BIH records into splits
+│   ├── export_stage2_to_npz.py        # Exports Stage 2 multiclass weights
+│   ├── export_weights_to_npz.py       # Fuses BatchNorm and exports Stage 1 weights
+│   └── train_stage2_multiclass.py     # Stage 2 5-class AAMI arrhythmia classifier
 │
-├── build_mitbih_splits.py           # Preprocesses raw MIT-BIH records into splits
-├── export_weights_to_npz.py         # Fuses BatchNorm and exports Stage 1 weights
-├── export_stage2_to_npz.py          # Exports Stage 2 multiclass weights
-├── train_stage2_multiclass.py       # Stage 2 5-class AAMI arrhythmia classifier
-├── test_viewer.html                 # Real-time HTML5 oscilloscope & alert visualizer
-├── LiveGuard_Hardware_Guide.docx    # Hardware wiring & assembly documentation
-├── LiveGuard_Laptop_Arduino_Quickstart.docx # Quickstart guide for laptop + Arduino setup
-└── README.md                        # Master documentation
+├── docs/                              # Guides & documentation generators
+│   ├── build_guide_docx.py            # Generates the hardware wiring guide
+│   ├── build_laptop_guide_docx.py     # Generates the laptop + Arduino quickstart
+│   ├── LiveGuard_Hardware_Guide.docx  # Hardware wiring & assembly documentation
+│   └── LiveGuard_Laptop_Arduino_Quickstart.docx # Quickstart guide for laptop + Arduino setup
+│
+├── data/                              # Partitioned datasets, weights, and evaluation metrics
+│   ├── fl_experiment_results.csv      # Centralized vs FL benchmark logs
+│   ├── mitbih_test_ready.npz          # Held-out patient test set
+│   ├── mitbih_train_ready.npz         # 38-patient non-IID training split
+│   ├── mitbih_val_ready.npz           # Validation patient split
+│   ├── stage1_cnn_centralized.pth     # Centralized PyTorch checkpoint
+│   └── stage1_weights.npz             # Fused NumPy weights
+│
+├── archive/                           # Raw MIT-BIH waveform database (gitignored, not committed)
+│
+├── tests/                             # Regression suites (Python unittest + Node frontend harness)
+│   ├── test_pipeline.py               # End-to-end pipeline & telemetry server tests
+│   ├── test_auth_flow.py              # Auth, handshake & rate-limit tests
+│   └── frontend_harness.js            # Headless viewer auth/broadcast tests
+│
+└── README.md                          # Master documentation
 ```
 
 ---
@@ -297,4 +341,4 @@ LiveGuard/
 ---
 
 ## 📜 License
-This project is licensed under the MIT License — see the [LICENSE](quickstart-pytorch/LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](training/quickstart-pytorch/LICENSE) file for details.
