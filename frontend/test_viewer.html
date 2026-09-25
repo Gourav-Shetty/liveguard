@@ -410,6 +410,11 @@
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let authWatchdog = null;
+    // Calling close() from the error handler of a FAILED handshake makes
+    // Node's WebSocket re-fire "error" in a feedback loop (~900 events);
+    // close the socket at most once per connection attempt. (Browsers
+    // tolerate repeated close(), but the once-guard is equivalent there.)
+    let socketErrorClosed = false;
     let currentUrl = "ws://raspberrypi.local:8765";
 
     const TOKEN_KEY = "liveguard_token";
@@ -702,6 +707,7 @@
       closingReason = null;
       hadOpen = false;
       lastAuthError = null;
+      socketErrorClosed = false;
 
       // detach any previous socket so its close event cannot corrupt the new state
       if (ws) {
@@ -756,6 +762,10 @@
     function handleSocketError(event) {
       // The server is probably not running; onclose fires right after this.
       console.warn("WebSocket connection error:", event && event.type ? event.type : event);
+      // Once per attempt only: on Node, close() during a failed handshake
+      // re-emits "error" and the handler would loop (~900 warns in 100ms).
+      if (socketErrorClosed) return;
+      socketErrorClosed = true;
       try { if (ws) ws.close(); } catch (e) {}
     }
 

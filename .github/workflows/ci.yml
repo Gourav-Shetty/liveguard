@@ -141,7 +141,12 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           "LIVEGUARD_DATA_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Start harness feeder
+      # The feeder lives in the SAME step as the harness: a process started
+      # in a previous step can be reaped when that step's shell exits
+      # (observed on windows-latest), which refused every socket and made
+      # the harness time out on its first frame. Start -> probe -> run ->
+      # always stop, in one process tree.
+      - name: Frontend harness
         run: |
           $p = Start-Process -FilePath python `
             -ArgumentList "tests/harness_feeder.py","8766" `
@@ -150,29 +155,40 @@ jobs:
             -RedirectStandardError "feeder.err" `
             -PassThru -NoNewWindow
           $p.Id | Set-Content feeder.pid
-          $ready = $false
-          for ($i = 0; $i -lt 60; $i++) {
-            if ((Test-Path feeder.log) -and
-                (Select-String -Path feeder.log -Pattern "harness feeder listening" -Quiet -ErrorAction SilentlyContinue)) {
-              $ready = $true
-              break
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              if ((Test-Path feeder.log) -and
+                  (Select-String -Path feeder.log -Pattern "harness feeder listening" -Quiet -ErrorAction SilentlyContinue)) {
+                $ready = $true
+                break
+              }
+              if ($p.HasExited) { break }
+              Start-Sleep -Seconds 1
             }
-            if ($p.HasExited) { break }
-            Start-Sleep -Seconds 1
+            if (-not $ready) {
+              Write-Output "feeder did not become ready within 60s"
+              if (Test-Path feeder.log) { Get-Content feeder.log -ErrorAction SilentlyContinue }
+              if (Test-Path feeder.err) { Get-Content feeder.err -ErrorAction SilentlyContinue }
+              exit 1
+            }
+            # Prove the port is reachable BEFORE node runs: a future failure
+            # then reports "port NOT reachable" instead of a bare timeout.
+            python -c "import socket; s = socket.create_connection(('127.0.0.1', 8766), 5); s.close(); print('port 8766 reachable')"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Output "feeder port NOT reachable"
+              if (Test-Path feeder.err) { Get-Content feeder.err -ErrorAction SilentlyContinue }
+              exit 1
+            }
+            node tests/frontend_harness.js ws://127.0.0.1:8766
+            exit $LASTEXITCODE
+          } finally {
+            if ($p -and -not $p.HasExited) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            }
           }
-          if (-not $ready) {
-            Write-Output "feeder did not become ready within 60s"
-            if (Test-Path feeder.log) { Get-Content feeder.log -ErrorAction SilentlyContinue }
-            if (Test-Path feeder.err) { Get-Content feeder.err -ErrorAction SilentlyContinue }
-            exit 1
-          }
-          Write-Output "feeder ready"
 
-      - name: Frontend harness
-        run: node tests/frontend_harness.js ws://127.0.0.1:8766
-
-      # feeder.log is only shown on the readiness-failure path above;
-      # dump it on ANY failure so harness errors are debuggable too.
+      # Full feeder log + stderr on ANY failure of the step above.
       - name: Dump feeder log on failure
         if: failure()
         run: |
