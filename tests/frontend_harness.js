@@ -34,6 +34,17 @@ const m = HTML.match(/<script>([\s\S]+)<\/script>/);
 if (!m) throw new Error("inline <script> not found in test_viewer.html");
 const SRC = m[1];
 
+// Fail fast with a readable diagnostic: the harness subclasses Node's
+// built-in WebSocket, which exists by default only from Node 21.
+if (typeof globalThis.WebSocket !== "function") {
+  console.error(
+    "HARNESS ERROR: globalThis.WebSocket is not available (Node " +
+      process.version +
+      "). Run this harness on Node >= 21 (CI uses Node 22)."
+  );
+  process.exit(2);
+}
+
 /* ------------------------------------------------------------------ */
 /* result bookkeeping                                                  */
 /* ------------------------------------------------------------------ */

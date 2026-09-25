@@ -120,7 +120,9 @@ class TelemetryServer:
             await asyncio.wait_for(
                 websocket.send(json.dumps(payload)), timeout=CLIENT_SEND_TIMEOUT
             )
-        except TimeoutError:
+        # asyncio.TimeoutError is only an alias of the builtin TimeoutError
+        # from Python 3.11; on 3.10 it is a distinct class, so catch both.
+        except (TimeoutError, asyncio.TimeoutError):
             await self._drop_slow_client(websocket, "reply")
         except ConnectionClosed:
             pass  # client went away before reading the reply
@@ -252,7 +254,7 @@ class TelemetryServer:
                 self._close(websocket, "slow client"),
                 timeout=SLOW_CLIENT_CLOSE_TIMEOUT,
             )
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             # The peer is not reading, so the closing handshake cannot
             # finish. Abort the TCP connection so the handler wakes up and
             # cleans the connection out immediately.
@@ -289,7 +291,11 @@ class TelemetryServer:
                 return None
             try:
                 message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
-            except TimeoutError:
+            # On Python 3.10 asyncio.TimeoutError is NOT the builtin
+            # TimeoutError (aliases only from 3.11), so catch both or the
+            # auth timeout escapes to the generic handler and the client is
+            # dropped with an empty close reason.
+            except (TimeoutError, asyncio.TimeoutError):
                 await self._close(websocket, "authentication timeout")
                 return None
             except ConnectionClosed:
@@ -574,7 +580,7 @@ class TelemetryServer:
             await asyncio.wait_for(
                 websocket.send(message), timeout=CLIENT_SEND_TIMEOUT
             )
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             await self._drop_slow_client(websocket, "broadcast")
         except ConnectionClosed:
             pass  # client went away; the handler cleans it up
