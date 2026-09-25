@@ -290,11 +290,11 @@ proximal-mu = 0.0 # set > 0 for FedProx
 
 Two regression suites cover the backend pipeline and the browser dashboard (GitHub Actions runs both on every push and pull request):
 
-* **Python suite — 42 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI):
+* **Python suite — 57 tests** (pipeline, telemetry server, authentication, rate limits, admin CLI, hardening: TLS fail-closed, slow-client drop, fan-out isolation, registration caps):
   ```bash
   python -m unittest discover -s tests -t .
   ```
-* **Node frontend harness — 26 checks** (headless viewer auth + broadcast checks; runs the real inline script of [`frontend/test_viewer.html`](frontend/test_viewer.html) outside the browser):
+* **Node frontend harness — 26 checks** (headless viewer auth + broadcast checks; runs the real inline script of [`frontend/test_viewer.html`](frontend/test_viewer.html) outside the browser; requires Node.js ≥ 21 — CI uses Node 22):
   ```bash
   # terminal 1 — synthetic telemetry feed (point it at a FRESH data dir:
   # registration only opens while the user store is empty)

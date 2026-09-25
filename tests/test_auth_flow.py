@@ -406,8 +406,8 @@ class IPBudgetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dir = tempfile.mkdtemp(prefix="lg_ipbudget_", dir=TMP_DATA_DIR)
-        store = UserStore(db_path=os.path.join(cls.dir, "budget.db"))
-        cls.auth = AuthService(store=store)
+        cls.store = UserStore(db_path=os.path.join(cls.dir, "budget.db"))
+        cls.auth = AuthService(store=cls.store)
         ok, msg = cls.auth.provision("budget_user", GOOD_PASSWORD)
         assert ok, msg
         cls.server = TelemetryServer(host="127.0.0.1", port=free_port(), auth=cls.auth)
@@ -417,6 +417,9 @@ class IPBudgetTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Close the sqlite handle first: on Windows an open budget.db blocks
+        # deletion and ignore_errors=True would silently leak the directory.
+        cls.store.close()
         shutil.rmtree(cls.dir, ignore_errors=True)
 
     def _budget(self) -> int:
