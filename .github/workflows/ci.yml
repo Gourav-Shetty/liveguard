@@ -92,3 +92,93 @@ jobs:
             kill "$(cat feeder.pid)" 2>/dev/null || true
           fi
           pkill -f "tests/harness_feeder.py" 2>/dev/null || true
+
+  # The project is developed on Windows (PowerShell commands are documented
+  # in the README), so run the same gates on a Windows runner as well --
+  # Python 3.11 is the locally-developed version.
+  test-windows:
+    name: Test (Windows, Python 3.11)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      LIVEGUARD_DATA_DIR: ${{ runner.temp }}\lg_ci_win
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Frontend harness syntax check
+        run: node --check tests/frontend_harness.js
+
+      - name: Install runtime dependencies
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Static compile gate
+        run: python -m compileall -q backend tests training docs
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t .
+
+      - name: Prepare feeder auth store
+        run: |
+          Remove-Item -Recurse -Force $env:LIVEGUARD_DATA_DIR -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $env:LIVEGUARD_DATA_DIR | Out-Null
+
+      - name: Start harness feeder
+        run: |
+          $p = Start-Process -FilePath python `
+            -ArgumentList "tests/harness_feeder.py","8766" `
+            -WorkingDirectory (Get-Location) `
+            -RedirectStandardOutput "feeder.log" `
+            -RedirectStandardError "feeder.err" `
+            -PassThru -NoNewWindow
+          $p.Id | Set-Content feeder.pid
+          $ready = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            if ((Test-Path feeder.log) -and
+                (Select-String -Path feeder.log -Pattern "harness feeder listening" -Quiet -ErrorAction SilentlyContinue)) {
+              $ready = $true
+              break
+            }
+            if ($p.HasExited) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) {
+            Write-Output "feeder did not become ready within 60s"
+            if (Test-Path feeder.log) { Get-Content feeder.log -ErrorAction SilentlyContinue }
+            if (Test-Path feeder.err) { Get-Content feeder.err -ErrorAction SilentlyContinue }
+            exit 1
+          }
+          Write-Output "feeder ready"
+
+      - name: Frontend harness
+        run: node tests/frontend_harness.js ws://127.0.0.1:8766
+
+      # feeder.log is only shown on the readiness-failure path above;
+      # dump it on ANY failure so harness errors are debuggable too.
+      - name: Dump feeder log on failure
+        if: failure()
+        run: |
+          if (Test-Path feeder.log) { Get-Content feeder.log }
+          if (Test-Path feeder.err) { Get-Content feeder.err }
+
+      - name: Stop feeder
+        if: always()
+        run: |
+          if (Test-Path feeder.pid) {
+            Stop-Process -Id (Get-Content feeder.pid) -Force -ErrorAction SilentlyContinue
+          }
