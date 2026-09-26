@@ -381,7 +381,7 @@ LiveGuard/
 
 ## 👥 Authors & Acknowledgments
 
-* **Gourav Shetty** & **Mirza H** — *Final Year Major Project*
+* **Gourav Shetty** — *Final Year Major Project*
 * **MIT-BIH Arrhythmia Database**: Mark, R., & Moody, G. (PhysioNet).
 * **Flower FL Framework**: Adapted for decentralized healthcare simulations.
 

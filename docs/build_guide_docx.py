@@ -185,7 +185,7 @@ def create_guide_docx():
         "• Digital signal processing (Bandpass, Notch filter, Pan-Tompkins QRS detection).\n"
         "• Edge inference pipeline & WebSocket telemetry server.\n"
         "• Web Dashboard frontend connection.\n\n"
-        "Machine Learning & Federated Learning Lead (Mirza):\n"
+        "Machine Learning & Federated Learning Lead (You):\n"
         "• Flower Federated Learning ServerApp & ClientApp.\n"
         "• Centralized baseline benchmarking & non-IID patient partitioning.\n"
         "• Stage 1 threshold calibration (Recall >= 0.95).\n"
